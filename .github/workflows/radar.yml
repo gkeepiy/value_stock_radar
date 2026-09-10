@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: value-stock-radar
+  cancel-in-progress: false
 
 jobs:
   update-radar:
@@ -57,5 +60,8 @@ jobs:
             echo "No data changes"
           else
             git commit -m "Update stock radar data"
-            git push
+
+            git pull --rebase origin main
+
+            git push origin main
           fi
