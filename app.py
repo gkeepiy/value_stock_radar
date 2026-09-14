@@ -1,4 +1,4 @@
- from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timezone
@@ -1687,14 +1687,27 @@ PORTFOLIO_COLUMNS = ["Ticker", "Buy Price", "Shares"]
 def get_supabase_config() -> tuple[str, str]:
     try:
         url = str(st.secrets["SUPABASE_URL"]).strip().rstrip("/")
-        key = str(st.secrets["SUPABASE_KEY"]).strip()
+
+        key = str(
+            st.secrets.get(
+                "SUPABASE_KEY",
+                st.secrets.get("SUPABASE_PUBLISHABLE_KEY", "")
+            )
+        ).strip()
+
     except Exception as exc:
         raise RuntimeError(
-            "Streamlit Secrets에 SUPABASE_URL과 SUPABASE_KEY를 저장해주세요."
+            "Streamlit Secrets에서 Supabase 설정을 읽지 못했습니다."
         ) from exc
 
-    if not url or not key:
-        raise RuntimeError("Supabase URL 또는 Key가 비어 있습니다.")
+    if not url:
+        raise RuntimeError("SUPABASE_URL이 없습니다.")
+
+    if not key:
+        raise RuntimeError(
+            "SUPABASE_KEY 또는 SUPABASE_PUBLISHABLE_KEY가 없습니다."
+        )
+
     return url, key
 
 
