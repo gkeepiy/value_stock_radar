@@ -1,10 +1,11 @@
-from __future__ import annotations
+ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -1677,73 +1678,123 @@ def get_current_usd_price(
 
 
 # ============================================================
-# PORTFOLIO DATA
+# PORTFOLIO DATA - SUPABASE
 # ============================================================
 
-def load_portfolio() -> pd.DataFrame:
-    if not PORTFOLIO_FILE.exists():
-        return pd.DataFrame(
-            columns=["Ticker", "Buy Price", "Shares"]
-        )
+PORTFOLIO_COLUMNS = ["Ticker", "Buy Price", "Shares"]
 
-    portfolio = pd.read_csv(PORTFOLIO_FILE)
 
-    for column in ["Ticker", "Buy Price", "Shares"]:
-        if column not in portfolio.columns:
-            portfolio[column] = np.nan
+def get_supabase_config() -> tuple[str, str]:
+    try:
+        url = str(st.secrets["SUPABASE_URL"]).strip().rstrip("/")
+        key = str(st.secrets["SUPABASE_KEY"]).strip()
+    except Exception as exc:
+        raise RuntimeError(
+            "Streamlit Secrets에 SUPABASE_URL과 SUPABASE_KEY를 저장해주세요."
+        ) from exc
 
-    portfolio["Ticker"] = (
-        portfolio["Ticker"]
-        .fillna("")
-        .astype(str)
-        .str.upper()
-        .str.strip()
+    if not url or not key:
+        raise RuntimeError("Supabase URL 또는 Key가 비어 있습니다.")
+    return url, key
+
+
+def supabase_headers() -> dict:
+    _, key = get_supabase_config()
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+
+def normalize_portfolio(portfolio: pd.DataFrame) -> pd.DataFrame:
+    result = portfolio.copy()
+    for column in PORTFOLIO_COLUMNS:
+        if column not in result.columns:
+            result[column] = np.nan
+
+    result["Ticker"] = (
+        result["Ticker"].fillna("").astype(str).str.upper().str.strip()
     )
-
     for column in ["Buy Price", "Shares"]:
-        portfolio[column] = pd.to_numeric(
-            portfolio[column],
-            errors="coerce",
-        )
+        result[column] = pd.to_numeric(result[column], errors="coerce")
 
-    return portfolio[
-        portfolio["Ticker"] != ""
-    ].copy()
+    return result[result["Ticker"] != ""][PORTFOLIO_COLUMNS].copy()
 
 
-def save_portfolio(
-    portfolio: pd.DataFrame,
-) -> None:
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+def load_portfolio() -> pd.DataFrame:
+    url, _ = get_supabase_config()
+    response = requests.get(
+        f"{url}/rest/v1/portfolio",
+        headers=supabase_headers(),
+        params={"select": "ticker,buy_price,shares", "order": "ticker.asc"},
+        timeout=15,
     )
+    response.raise_for_status()
+    rows = response.json()
 
-    save_df = portfolio[
-        [
-            "Ticker",
-            "Buy Price",
-            "Shares",
+    if not rows:
+        return pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+
+    portfolio = pd.DataFrame(rows).rename(
+        columns={
+            "ticker": "Ticker",
+            "buy_price": "Buy Price",
+            "shares": "Shares",
+        }
+    )
+    return normalize_portfolio(portfolio)
+
+
+def save_portfolio(portfolio: pd.DataFrame) -> None:
+    url, _ = get_supabase_config()
+    save_df = normalize_portfolio(portfolio)
+
+    response = requests.get(
+        f"{url}/rest/v1/portfolio",
+        headers=supabase_headers(),
+        params={"select": "ticker"},
+        timeout=15,
+    )
+    response.raise_for_status()
+
+    remote_tickers = {
+        str(row.get("ticker", "")).upper().strip()
+        for row in response.json()
+        if row.get("ticker")
+    }
+    local_tickers = set(save_df["Ticker"].tolist())
+
+    if not save_df.empty:
+        payload = [
+            {
+                "ticker": row["Ticker"],
+                "buy_price": float(row["Buy Price"]),
+                "shares": float(row["Shares"]),
+            }
+            for _, row in save_df.iterrows()
         ]
-    ].copy()
 
-    save_df["Ticker"] = (
-        save_df["Ticker"]
-        .fillna("")
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
+        headers = supabase_headers()
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
 
-    save_df = save_df[
-        save_df["Ticker"] != ""
-    ].copy()
+        response = requests.post(
+            f"{url}/rest/v1/portfolio",
+            headers=headers,
+            params={"on_conflict": "ticker"},
+            json=payload,
+            timeout=15,
+        )
+        response.raise_for_status()
 
-    save_df.to_csv(
-        PORTFOLIO_FILE,
-        index=False,
-        encoding="utf-8-sig",
-    )
+    for ticker in sorted(remote_tickers - local_tickers):
+        response = requests.delete(
+            f"{url}/rest/v1/portfolio",
+            headers=supabase_headers(),
+            params={"ticker": f"eq.{ticker}"},
+            timeout=15,
+        )
+        response.raise_for_status()
 
 
 def build_portfolio_view(
@@ -2303,7 +2354,15 @@ def show_portfolio_page(
         "현재가를 EUR로 환산합니다."
     )
 
-    portfolio = load_portfolio()
+    try:
+        portfolio = load_portfolio()
+    except Exception as exc:
+        st.error("Supabase에서 포트폴리오를 불러오지 못했습니다.")
+        st.code(str(exc))
+        st.info(
+            "Streamlit Secrets와 Supabase portfolio 테이블/RLS 설정을 확인해주세요."
+        )
+        return
 
     # --------------------------------------------------------
     # ADD STOCK
