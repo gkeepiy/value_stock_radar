@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from phase3_technical import add_combined_scores, normalize_tickers
 
 
 # ============================================================
@@ -199,38 +200,9 @@ def to_bool(
 # 3) COMBINED SCORE
 # ============================================================
 
-def calculate_combined_score(
-    row: pd.Series,
-) -> float:
-
-    fundamental = to_float(
-        row.get(
-            "Fundamental Score"
-        )
-    )
-
-    technical = to_float(
-        row.get(
-            "Technical Score"
-        )
-    )
-
-    if (
-        fundamental is None
-        or technical is None
-    ):
-
-        return 0.0
-
-    score = (
-        fundamental
-        + technical
-    ) / 2
-
-    return round(
-        score,
-        2,
-    )
+def calculate_combined_score(row: pd.Series) -> float:
+    """Use the shared F50/T30/C15/S5 calculation."""
+    return float(add_combined_scores(pd.DataFrame([row]))["Combined Score"].iloc[0])
 
 
 # ============================================================
@@ -809,6 +781,9 @@ def determine_confidence(
 
         return "NONE"
 
+    if row.get("Combined Data Quality") != "OK":
+        return "UNAVAILABLE"
+
     fundamental = to_float(
         row.get(
             "Fundamental Score"
@@ -1008,122 +983,27 @@ def evaluate_signals(
 # 13) RUN SIGNAL ENGINE
 # ============================================================
 
-def run_signal_engine(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
-    result = df.copy()
-
-    print()
-    print(
-        "🚦 Signal Engine 실행..."
-    )
-
-    # --------------------------------------------------------
-    # Combined Score 먼저 생성
-    # --------------------------------------------------------
-
-    result[
-        "Combined Score"
-    ] = result.apply(
-        calculate_combined_score,
-        axis=1,
-    )
-
-    signal_rows = []
-
-    total = len(
-        result
-    )
-
-    for index, (_, row) in enumerate(
-        result.iterrows(),
-        start=1,
-    ):
-
-        evaluation = (
-            evaluate_signals(
-                row
-            )
-        )
-
-        signal_rows.append(
-            evaluation
-        )
-
-        if (
-            index % 50 == 0
-            or index == total
-        ):
-
-            print(
-                f"Signal 분석: "
-                f"{index}/{total}"
-            )
-
-    signal_df = pd.DataFrame(
-        signal_rows,
-        index=result.index,
-    )
-
-    result = pd.concat(
-        [
-            result,
-            signal_df,
-        ],
-        axis=1,
-    )
-
-    return result
+def run_signal_engine(df: pd.DataFrame) -> pd.DataFrame:
+    result = add_combined_scores(normalize_tickers(df))
+    print("🚦 Signal Engine 실행...")
+    columns = list(evaluate_signals(pd.Series(dtype=object)))
+    signal_rows = [evaluate_signals(row) for _, row in result.iterrows()]
+    signal_df = pd.DataFrame(signal_rows, index=result.index, columns=columns)
+    result = result.drop(columns=columns, errors="ignore")
+    return pd.concat([result, signal_df], axis=1)
 
 
 # ============================================================
 # 14) DISPLAY RANK
 # ============================================================
 
-def add_display_rank(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
+def add_display_rank(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
-
-    # Signal 발생 종목만 대상으로 Rank
-    active = (
-        result[
-            "Primary Signal"
-        ]
-        != "NONE"
-    )
-
-    result[
-        "Signal Rank"
-    ] = pd.Series(
-        pd.NA,
-        index=result.index,
-        dtype="Int64",
-    )
-
-    if active.any():
-
-        ranked = (
-            result.loc[
-                active,
-                "Combined Score",
-            ]
-            .rank(
-                ascending=False,
-                method="min",
-            )
-            .astype(
-                "Int64"
-            )
-        )
-
-        result.loc[
-            active,
-            "Signal Rank"
-        ] = ranked
-
+    result["Display Rank"] = result["Combined Rank"].astype("Int64")
+    active = result["Primary Signal"].ne("NONE") & result["Combined Data Quality"].eq("OK")
+    result["Signal Rank"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    result.loc[active, "Signal Rank"] = result.loc[active, "Combined Score"].rank(
+        ascending=False, method="min").astype("Int64")
     return result
 
 
@@ -1190,6 +1070,9 @@ def reorder_columns(
 ) -> pd.DataFrame:
 
     priority = [
+        "Display Rank", "Combined Rank", "Cycle Score", "Seasonality Score",
+        "Combined Data Quality", "Combined Missing Inputs", "Score Model",
+        "Williams %R", "Williams State", "Oscillator Confirmation",
 
         "Signal Rank",
 
@@ -1317,79 +1200,13 @@ def reorder_columns(
 # 17) SAVE PHASE 4
 # ============================================================
 
-def save_phase4(
-    df: pd.DataFrame,
-) -> Path:
-
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    today = (
-        datetime.now()
-        .strftime(
-            "%Y-%m-%d"
-        )
-    )
-
-    path = (
-        DATA_DIR
-        / (
-            "sp500_radar_signals_"
-            f"{today}.csv"
-        )
-    )
-
-    # --------------------------------------------------------
-    # Signal 종목 우선
-    # 그 안에서는 Combined Score 순
-    # --------------------------------------------------------
-
-    output = df.copy()
-
-    output[
-        "_has_signal"
-    ] = (
-        output[
-            "Primary Signal"
-        ]
-        != "NONE"
-    ).astype(
-        int
-    )
-
-    output = output.sort_values(
-
-        by=[
-            "_has_signal",
-            "Combined Score",
-            "Fundamental Score",
-            "Technical Score",
-        ],
-
-        ascending=[
-            False,
-            False,
-            False,
-            False,
-        ],
-
-        na_position="last",
-    )
-
-    output = output.drop(
-        columns=[
-            "_has_signal"
-        ]
-    )
-
-    output.to_csv(
-        path,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
+def save_phase4(df: pd.DataFrame) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / f"sp500_radar_signals_{datetime.now():%Y-%m-%d}.csv"
+    # Score ordering is independent of signal presence.
+    output = df.sort_values(["Combined Score", "Fundamental Score", "Technical Score"],
+                            ascending=False, na_position="last")
+    output.to_csv(path, index=False, encoding="utf-8-sig")
     return path
 
 
@@ -1487,6 +1304,8 @@ def print_top_signals(
         ]
         != "NONE"
     ].copy()
+
+    active = active[active["Combined Data Quality"].eq("OK")]
 
     if active.empty:
 
