@@ -12,8 +12,7 @@ from phase3_technical import WEIGHTS, add_combined_scores, finite, normalize_tic
 
 DATA_DIR = Path("data")
 PHASE4_PATTERN = "sp500_radar_signals_*.csv"
-SCORE_LABELS = {"Fundamental Score": "펀더멘털", "Technical Score": "기술적 분석",
-                "Cycle Score": "경기·산업 순환", "Seasonality Score": "계절성"}
+SCORE_LABELS = {"Fundamental Score": "펀더멘털", "Technical Score": "기술적 분석"}
 LABELS = {"Display Rank": "순위", "Ticker": "종목", "Short Name": "기업명",
           "Sector": "업종", "Combined Score": "종합점수", "Price": "주가",
           "Currency": "통화", "Technical As Of": "가격 기준일",
@@ -24,12 +23,6 @@ STATE_LABELS = {"STRONG_UPTREND": "강한 상승 추세", "UPTREND": "상승 추
                 "OVERSOLD": "과매도", "OVERBOUGHT": "과매수", "EXTREME_OVERSOLD": "극단적 과매도",
                 "EXTREME_OVERBOUGHT": "극단적 과매수", "OVERHEATED": "과열", "RECOVERY": "회복",
                 "WEAKENING": "약화", "UNKNOWN": "자료 부족"}
-QUALITY_LABELS = {"OK": "정상", "MISSING": "자료 없음", "PARTIAL": "일부 자료 부족",
-                  "FAILED": "자료 조회 실패", "STALE": "자료가 오래됨", "INVALID": "유효하지 않은 자료",
-                  "INSUFFICIENT_HISTORY": "과거 이력 부족", "FUTURE_OR_INVALID_DATE": "기준일 확인 필요",
-                  "DUPLICATE_RECORDS": "중복 자료", "INVALID_SCORE_OR_SOURCE": "점수 또는 출처 확인 필요"}
-
-
 def safe_text(value, default="—") -> str:
     if value is None or pd.isna(value) or str(value).strip() in {"", "NONE", "nan"}:
         return default
@@ -67,8 +60,7 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     numeric = list(WEIGHTS) + ["Price", "RSI14", "Stoch K", "Stoch D", "Williams %R", "Momentum 3M",
               "Momentum 6M", "52W Drawdown", "MA50", "MA200", "Volume Ratio", "Value Score", "Quality Score",
               "Growth Score", "Stability Score", "PBR", "Forward PER", "PSR", "EV/EBITDA", "FCF Yield",
-              "ROE", "ROA", "Debt/Equity", "Operating Margin", "Profit Margin", "Seasonality Samples",
-              "Seasonality Month", "Seasonality Mean Return", "Seasonality Win Rate", "Trend Score",
+              "ROE", "ROA", "Debt/Equity", "Operating Margin", "Profit Margin", "Trend Score",
               "Momentum Score", "RSI Score", "Stochastic Score", "Volume Score"]
     for column in numeric:
         if column not in result:
@@ -167,21 +159,6 @@ def show_technical(row: pd.Series) -> None:
         st.warning("두 오실레이터의 계산값이 일치하지 않아 원자료 확인이 필요합니다.")
 
 
-def show_cycle_seasonality(row: pd.Series) -> None:
-    metrics(row, [("Cycle Score", "경기·산업 순환 /100", "number"), ("Seasonality Score", "계절성 /100", "number")])
-    st.write("순환 자료 상태:", QUALITY_LABELS.get(safe_text(row.get("Cycle Data Quality")), "자료 확인 필요"))
-    st.write("기준일:", safe_text(row.get("Cycle As Of")))
-    st.write("출처:", safe_text(row.get("Cycle Source")))
-    if safe_text(row.get("Cycle Notes")) != "—":
-        st.write("설명:", safe_text(row.get("Cycle Notes")))
-    st.divider()
-    st.write("계절성 자료 상태:", QUALITY_LABELS.get(safe_text(row.get("Seasonality Data Quality")), "자료 확인 필요"))
-    metrics(row, [("Seasonality Month", "대상 월", "number"), ("Seasonality Samples", "과거 동월 표본 수", "number"),
-                  ("Seasonality Mean Return", "과거 동월 평균 수익률", "percent"),
-                  ("Seasonality Win Rate", "과거 동월 상승 비율", "percent")])
-    st.caption("완료된 과거 월별 데이터만 사용합니다. 동월 상승 비율은 미래 적중률이 아닙니다.")
-
-
 def show_stock_detail(row: pd.Series) -> None:
     st.subheader(f"{row['Ticker']} · {safe_text(row.get('Short Name'))}")
     st.caption(f"{safe_text(row.get('Sector'))} · {safe_text(row.get('Industry'))} · 가격 기준일 {safe_text(row.get('Technical As Of'))}")
@@ -202,13 +179,11 @@ def show_stock_detail(row: pd.Series) -> None:
                         "WEAK_6M_MOMENTUM": "6개월 모멘텀 약화", "DEEP_PRICE_COLLAPSE": "고점 대비 큰 하락",
                         "STOCH_BEARISH_CROSS": "스토캐스틱 하향 교차"}
         st.warning("참고할 위험 요인: " + ", ".join(translations.get(v, v) for v in risks.split("|")))
-    tabs = st.tabs(["펀더멘털", "기술적 분석", "순환·계절성"])
+    tabs = st.tabs(["펀더멘털", "기술적 분석"])
     with tabs[0]:
         show_fundamental(row)
     with tabs[1]:
         show_technical(row)
-    with tabs[2]:
-        show_cycle_seasonality(row)
 
 
 def choose_stock(df: pd.DataFrame, key: str) -> pd.Series | None:
@@ -222,7 +197,7 @@ def choose_stock(df: pd.DataFrame, key: str) -> pd.Series | None:
 
 def show_stock_recommendations(raw_df: pd.DataFrame, source_path: Path) -> None:
     st.title("주식추천 레이더")
-    st.caption("펀더멘털 50% · 기술적 분석 30% · 경기·산업 순환 15% · 계절성 5%")
+    st.caption("펀더멘털 62.5% · 기술적 분석 37.5%")
     st.sidebar.header("종목 필터")
     sectors = None
     if "Sector" in raw_df:
@@ -240,7 +215,7 @@ def show_stock_recommendations(raw_df: pd.DataFrame, source_path: Path) -> None:
     boxes[1].metric("평균 종합점수", number_text(ready["Combined Score"].mean()))
     boxes[2].metric("자료 부족", len(pending))
     if ready.empty:
-        st.info("현재 필터에서 네 가지 평가 자료를 모두 갖춘 종목이 없습니다.")
+        st.info("현재 필터에서 펀더멘털·기술 점수를 모두 갖춘 종목이 없습니다.")
     else:
         shown = ready if limit == "전체" else ready.head(int(limit))
         st.dataframe(display_table(shown), hide_index=True, width="stretch", height=520)
