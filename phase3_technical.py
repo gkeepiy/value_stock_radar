@@ -1,1872 +1,689 @@
 from __future__ import annotations
 
+"""AI Value Stock Radar — Phase 3.
+
+Run: python phase3_technical.py
+After Phase 4: python phase3_technical.py --reweight-phase4 latest
+
+Fundamental scores are preserved. Technical scoring retains the original
+30/20/15/15/10 allocation (90 raw points, normalized to 100).
+Williams %R is informational only. Combined Score requires all four inputs;
+missing cycle/seasonality data is never replaced with an invented score.
+See README_KO.md for the external cycle input and seasonality assumptions.
+"""
+
+import argparse
+import re
+import shutil
 import typing as t
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
-
-
-# ============================================================
-# 0) CONFIG
-# ============================================================
 
 DATA_DIR = Path("data")
-
-PHASE2_PATTERN = (
-    "sp500_fundamental_scores_*.csv"
-)
-
-PRICE_PERIOD = "2y"
+PHASE2_PATTERN = "sp500_fundamental_scores_*.csv"
+PHASE3_PATTERN = "sp500_technical_scores_*.csv"
+PHASE4_PATTERN = "sp500_radar_signals_*.csv"
+PRICE_PERIOD = "10y"  # Long enough for calendar-month seasonality.
 PRICE_INTERVAL = "1d"
-
 RSI_PERIOD = 14
-
 STOCH_K_PERIOD = 14
 STOCH_D_PERIOD = 3
-
-MA_SHORT = 50
-MA_LONG = 200
-
-MOMENTUM_3M_DAYS = 63
-MOMENTUM_6M_DAYS = 126
-
+WILLIAMS_PERIOD = 14
+MA_SHORT, MA_LONG = 50, 200
+MOMENTUM_3M_DAYS, MOMENTUM_6M_DAYS = 63, 126
 HIGH_52W_DAYS = 252
-
 VOLUME_PERIOD = 20
+SEASONALITY_YEARS = 10
+SEASONALITY_MIN_SAMPLES = 5
+SEASONALITY_SHRINKAGE = 5.0
+CYCLE_MAX_AGE_DAYS = 120
+PRICE_MAX_AGE_DAYS = 7
+SCORE_MODEL = "F50_T30_C15_S5_v1"
+WEIGHTS = {"Fundamental Score": 0.50, "Technical Score": 0.30,
+           "Cycle Score": 0.15, "Seasonality Score": 0.05}
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
-# ============================================================
-# 1) LOAD PHASE 2
-# ============================================================
+def finite(value: t.Any) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def valid_score(value: t.Any) -> bool:
+    return finite(value) and 0 <= float(value) <= 100
+
+
+def utc_day(value: t.Any = None) -> pd.Timestamp:
+    stamp = pd.Timestamp(value) if value is not None else pd.Timestamp.now(tz="UTC")
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("UTC").tz_localize(None)
+    return stamp.normalize()
+
+
+def latest_file(pattern: str) -> Path:
+    paths = list(DATA_DIR.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(f"입력 파일을 찾을 수 없습니다: {DATA_DIR / pattern}")
+    return max(paths, key=lambda p: (p.stat().st_mtime_ns, p.name))
+
 
 def find_latest_phase2_file() -> Path:
-
-    files = list(
-        DATA_DIR.glob(
-            PHASE2_PATTERN
-        )
-    )
-
-    if not files:
-
-        raise FileNotFoundError(
-            "Phase 2 결과 파일을 찾을 수 없습니다.\n"
-            "data/sp500_fundamental_scores_YYYY-MM-DD.csv "
-            "파일이 있는지 확인하세요."
-        )
-
-    return max(
-        files,
-        key=lambda p: p.stat().st_mtime,
-    )
+    return latest_file(PHASE2_PATTERN)
 
 
-def load_phase2_data() -> tuple[
-    pd.DataFrame,
-    Path,
-]:
-
-    path = (
-        find_latest_phase2_file()
-    )
-
-    print(
-        f"📂 Phase 2 데이터 로드: {path}"
-    )
-
-    df = pd.read_csv(
-        path
-    )
-
+def normalize_tickers(df: pd.DataFrame) -> pd.DataFrame:
     if "Ticker" not in df.columns:
-
-        raise ValueError(
-            "Phase 2 데이터에 Ticker 컬럼이 없습니다."
-        )
-
-    df["Ticker"] = (
-        df["Ticker"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-    )
-
-    return (
-        df,
-        path,
-    )
+        raise ValueError("Ticker 컬럼이 없습니다.")
+    result = df.copy()
+    result["Ticker"] = result["Ticker"].astype("string").str.strip().str.upper()
+    result = result[result["Ticker"].notna() & result["Ticker"].ne("")].copy()
+    if result["Ticker"].duplicated().any():
+        raise ValueError("중복 Ticker가 있습니다. 중복 행을 정리하세요.")
+    return result
 
 
-# ============================================================
-# 2) DOWNLOAD PRICE DATA
-# ============================================================
+def load_phase2_data() -> tuple[pd.DataFrame, Path]:
+    path = find_latest_phase2_file()
+    df = normalize_tickers(pd.read_csv(path))
+    if "Fundamental Score" not in df.columns:
+        raise ValueError("Phase 2에 Fundamental Score 컬럼이 없습니다.")
+    if df.empty:
+        raise ValueError("분석할 종목이 없습니다.")
+    print(f"📂 Phase 2 데이터 로드: {path}")
+    return df, path
 
-def download_price_data(
-    tickers: list[str],
-) -> pd.DataFrame:
 
-    print()
-    print(
-        f"📡 {len(tickers)}개 종목 "
-        f"가격 데이터 다운로드..."
-    )
-
-    prices = yf.download(
-        tickers=tickers,
-        period=PRICE_PERIOD,
-        interval=PRICE_INTERVAL,
-        auto_adjust=True,
-        group_by="ticker",
-        threads=True,
-        progress=True,
-    )
-
-    if (
-        prices is None
-        or prices.empty
-    ):
-
-        raise RuntimeError(
-            "가격 데이터를 다운로드하지 못했습니다."
-        )
-
+def download_price_data(tickers: list[str]) -> pd.DataFrame:
+    # Import lazily so the numerical checks can run without network/yfinance.
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        raise RuntimeError("먼저 pip install numpy pandas yfinance 를 실행하세요.") from exc
+    print(f"📡 {len(tickers)}개 종목: {PRICE_PERIOD} 일별 가격 다운로드")
+    # end is exclusive. Exclude today's possibly unfinished daily bar.
+    prices = yf.download(tickers=tickers, period=PRICE_PERIOD,
+                         end=utc_day().strftime("%Y-%m-%d"), interval=PRICE_INTERVAL,
+                         auto_adjust=True, group_by="ticker", threads=True,
+                         progress=True)
+    if prices is None or prices.empty:
+        raise RuntimeError("가격 데이터를 다운로드하지 못했습니다.")
+    if not isinstance(prices.columns, pd.MultiIndex) and len(tickers) != 1:
+        raise ValueError("여러 종목의 가격 데이터에 종목별 열 구분이 없습니다.")
+    if len(tickers) == 1:
+        prices.attrs["single_ticker"] = tickers[0]
     return prices
 
 
-# ============================================================
-# 3) EXTRACT SINGLE TICKER
-# ============================================================
-
-def extract_ticker_frame(
-    prices: pd.DataFrame,
-    ticker: str,
-) -> pd.DataFrame:
-
-    if isinstance(
-        prices.columns,
-        pd.MultiIndex,
-    ):
-
-        level0 = (
-            prices.columns
-            .get_level_values(0)
-            .astype(str)
-        )
-
-        level1 = (
-            prices.columns
-            .get_level_values(1)
-            .astype(str)
-        )
-
-        if ticker in level0:
-
-            df = prices[
-                ticker
-            ].copy()
-
-        elif ticker in level1:
-
-            df = prices.xs(
-                ticker,
-                axis=1,
-                level=1,
-            ).copy()
-
+def extract_ticker_frame(prices: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if isinstance(prices.columns, pd.MultiIndex):
+        if ticker in prices.columns.get_level_values(0):
+            df = prices[ticker].copy()
+        elif ticker in prices.columns.get_level_values(1):
+            df = prices.xs(ticker, axis=1, level=1).copy()
         else:
-
             return pd.DataFrame()
-
     else:
-
+        if prices.attrs.get("single_ticker", ticker) != ticker:
+            return pd.DataFrame()
         df = prices.copy()
-
-    required = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-    ]
-
-    if not set(
-        required
-    ).issubset(
-        set(
-            df.columns
-        )
-    ):
-
+    if not set(OHLCV).issubset(df.columns):
         return pd.DataFrame()
-
-    df = df[
-        required
-    ].copy()
-
-    for column in required:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
-
-    df = df.dropna(
-        subset=[
-            "Close"
-        ]
-    )
-
-    df = df.sort_index()
-
-    return df
+    df = df[OHLCV].apply(pd.to_numeric, errors="coerce")
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df.index = pd.DatetimeIndex(pd.to_datetime(df.index))
+    if df.index.tz is not None:
+        # Preserve the exchange-local calendar date of a daily bar.
+        df.index = df.index.tz_localize(None)
+    df.index = df.index.normalize()
+    return df.loc[~df.index.duplicated(keep="last")].dropna(subset=["Close"]).sort_index()
 
 
-# ============================================================
-# 4) RSI
-# ============================================================
-
-def calculate_rsi(
-    close: pd.Series,
-    period: int = RSI_PERIOD,
-) -> pd.Series:
-
+def calculate_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
     delta = close.diff()
-
-    gain = delta.clip(
-        lower=0
-    )
-
-    loss = (
-        -delta.clip(
-            upper=0
-        )
-    )
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    rs = (
-        avg_gain
-        / avg_loss.replace(
-            0,
-            np.nan,
-        )
-    )
-
-    rsi = (
-        100
-        -
-        (
-            100
-            / (
-                1 + rs
-            )
-        )
-    )
-
-    rsi = rsi.where(
-        avg_loss != 0,
-        100.0,
-    )
-
-    rsi = rsi.where(
-        avg_gain != 0,
-        0.0,
-    )
-
-    return rsi
+    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+    # A completely flat series is neutral, not oversold.
+    return rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
 
 
-# ============================================================
-# 5) STOCHASTIC
-# ============================================================
-
-def calculate_stochastic(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-) -> tuple[
-    pd.Series,
-    pd.Series,
-]:
-
-    lowest = low.rolling(
-        STOCH_K_PERIOD
-    ).min()
-
-    highest = high.rolling(
-        STOCH_K_PERIOD
-    ).max()
-
-    denominator = (
-        highest
-        - lowest
-    )
-
-    k = (
-        100
-        * (
-            close
-            - lowest
-        )
-        / denominator.replace(
-            0,
-            np.nan,
-        )
-    )
-
-    d = k.rolling(
-        STOCH_D_PERIOD
-    ).mean()
-
-    return (
-        k,
-        d,
-    )
+def calculate_stochastic(high: pd.Series, low: pd.Series,
+                         close: pd.Series) -> tuple[pd.Series, pd.Series]:
+    lowest = low.rolling(STOCH_K_PERIOD).min()
+    highest = high.rolling(STOCH_K_PERIOD).max()
+    width = (highest - lowest).where(highest > lowest)
+    k = 100 * (close - lowest) / width
+    return k, k.rolling(STOCH_D_PERIOD).mean()
 
 
-# ============================================================
-# 6) ADD INDICATORS
-# ============================================================
+def calculate_williams_r(high: pd.Series, low: pd.Series,
+                         close: pd.Series) -> pd.Series:
+    highest = high.rolling(WILLIAMS_PERIOD).max()
+    lowest = low.rolling(WILLIAMS_PERIOD).min()
+    width = (highest - lowest).where(highest > lowest)
+    return -100 * (highest - close) / width
 
-def add_indicators(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
 
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
-
-    result[
-        "MA50"
-    ] = (
-        result["Close"]
-        .rolling(
-            MA_SHORT
-        )
-        .mean()
-    )
-
-    result[
-        "MA200"
-    ] = (
-        result["Close"]
-        .rolling(
-            MA_LONG
-        )
-        .mean()
-    )
-
-    result[
-        "RSI14"
-    ] = calculate_rsi(
-        result[
-            "Close"
-        ]
-    )
-
-    (
-        result[
-            "Stoch K"
-        ],
-        result[
-            "Stoch D"
-        ],
-    ) = calculate_stochastic(
-        result[
-            "High"
-        ],
-        result[
-            "Low"
-        ],
-        result[
-            "Close"
-        ],
-    )
-
-    result[
-        "Momentum 3M"
-    ] = (
-        result[
-            "Close"
-        ]
-        / result[
-            "Close"
-        ].shift(
-            MOMENTUM_3M_DAYS
-        )
-        - 1
-    )
-
-    result[
-        "Momentum 6M"
-    ] = (
-        result[
-            "Close"
-        ]
-        / result[
-            "Close"
-        ].shift(
-            MOMENTUM_6M_DAYS
-        )
-        - 1
-    )
-
-    result[
-        "52W High"
-    ] = (
-        result[
-            "High"
-        ]
-        .rolling(
-            HIGH_52W_DAYS,
-            min_periods=100,
-        )
-        .max()
-    )
-
-    result[
-        "52W Drawdown"
-    ] = (
-        result[
-            "Close"
-        ]
-        / result[
-            "52W High"
-        ]
-        - 1
-    )
-
-    result[
-        "Volume 20D Avg"
-    ] = (
-        result[
-            "Volume"
-        ]
-        .rolling(
-            VOLUME_PERIOD
-        )
-        .mean()
-    )
-
-    result[
-        "Volume Ratio"
-    ] = (
-        result[
-            "Volume"
-        ]
-        / result[
-            "Volume 20D Avg"
-        ].replace(
-            0,
-            np.nan,
-        )
-    )
-
-    result[
-        "Daily Return"
-    ] = (
-        result[
-            "Close"
-        ]
-        .pct_change()
-    )
-
+    close = result["Close"]
+    result["MA50"] = close.rolling(MA_SHORT).mean()
+    result["MA200"] = close.rolling(MA_LONG).mean()
+    result["RSI14"] = calculate_rsi(close)
+    result["Stoch K"], result["Stoch D"] = calculate_stochastic(
+        result["High"], result["Low"], close)
+    result["Williams %R"] = calculate_williams_r(result["High"], result["Low"], close)
+    result["Momentum 3M"] = close / close.shift(MOMENTUM_3M_DAYS) - 1
+    result["Momentum 6M"] = close / close.shift(MOMENTUM_6M_DAYS) - 1
+    # Do not label a 100-day high as an actual 52-week high.
+    result["52W High"] = result["High"].rolling(HIGH_52W_DAYS).max()
+    result["52W Drawdown"] = close / result["52W High"] - 1
+    # Preserve the supplied implementation: the 20-day average includes today.
+    result["Volume 20D Avg"] = result["Volume"].rolling(VOLUME_PERIOD).mean()
+    result["Volume Ratio"] = result["Volume"] / result["Volume 20D Avg"].replace(0, np.nan)
+    result["Daily Return"] = close.pct_change(fill_method=None)
     return result
 
 
-# ============================================================
-# 7) CROSS DETECTION
-# ============================================================
-
-def crossed_above(
-    a: pd.Series,
-    b: pd.Series,
-) -> bool:
-
-    if (
-        len(a) < 2
-        or len(b) < 2
-    ):
-
+def crossed_above(a: pd.Series, b: pd.Series) -> bool:
+    if len(a) < 2 or len(b) < 2 or not all(finite(x) for x in
+                                           [a.iloc[-2], a.iloc[-1], b.iloc[-2], b.iloc[-1]]):
         return False
-
-    values = [
-        a.iloc[-2],
-        a.iloc[-1],
-        b.iloc[-2],
-        b.iloc[-1],
-    ]
-
-    if any(
-        pd.isna(x)
-        for x in values
-    ):
-
-        return False
-
-    return (
-        a.iloc[-2]
-        <= b.iloc[-2]
-        and
-        a.iloc[-1]
-        > b.iloc[-1]
-    )
+    return bool(a.iloc[-2] <= b.iloc[-2] and a.iloc[-1] > b.iloc[-1])
 
 
-def crossed_below(
-    a: pd.Series,
-    b: pd.Series,
-) -> bool:
-
-    if (
-        len(a) < 2
-        or len(b) < 2
-    ):
-
-        return False
-
-    values = [
-        a.iloc[-2],
-        a.iloc[-1],
-        b.iloc[-2],
-        b.iloc[-1],
-    ]
-
-    if any(
-        pd.isna(x)
-        for x in values
-    ):
-
-        return False
-
-    return (
-        a.iloc[-2]
-        >= b.iloc[-2]
-        and
-        a.iloc[-1]
-        < b.iloc[-1]
-    )
+def crossed_below(a: pd.Series, b: pd.Series) -> bool:
+    return crossed_above(b, a)
 
 
-# ============================================================
-# 8) TREND STATE
-# ============================================================
-
-def classify_trend(
-    price: float,
-    ma50: float,
-    ma200: float,
-    momentum_6m: float,
-) -> str:
-
-    required = [
-        price,
-        ma50,
-        ma200,
-    ]
-
-    if any(
-        pd.isna(x)
-        for x in required
-    ):
-
+def classify_trend(price: float, ma50: float, ma200: float, momentum_6m: float) -> str:
+    if not all(finite(v) for v in [price, ma50, ma200]):
         return "UNKNOWN"
-
-    if (
-        price > ma50
-        and ma50 > ma200
-        and (
-            pd.isna(
-                momentum_6m
-            )
-            or momentum_6m > 0
-        )
-    ):
-
+    if price > ma50 > ma200 and (not finite(momentum_6m) or momentum_6m > 0):
         return "STRONG_UPTREND"
-
-    if (
-        price > ma200
-        and ma50 > ma200
-    ):
-
+    if price > ma200 and ma50 > ma200:
         return "UPTREND"
-
-    if (
-        price < ma50
-        and ma50 < ma200
-    ):
-
+    if price < ma50 < ma200:
         return "STRONG_DOWNTREND"
-
-    if price < ma200:
-
-        return "DOWNTREND"
-
-    return "NEUTRAL"
+    return "DOWNTREND" if price < ma200 else "NEUTRAL"
 
 
-# ============================================================
-# 9) RSI STATE
-# ============================================================
-
-def classify_rsi(
-    rsi: float,
-) -> str:
-
-    if pd.isna(
-        rsi
-    ):
-
+def classify_rsi(rsi: float) -> str:
+    if not finite(rsi):
         return "UNKNOWN"
-
     if rsi >= 75:
-
         return "EXTREME_OVERBOUGHT"
-
     if rsi >= 70:
-
         return "OVERBOUGHT"
-
     if rsi <= 25:
-
         return "EXTREME_OVERSOLD"
-
     if rsi <= 30:
-
         return "OVERSOLD"
-
     if rsi >= 55:
-
         return "BULLISH"
-
-    if rsi <= 45:
-
-        return "BEARISH"
-
-    return "NEUTRAL"
+    return "BEARISH" if rsi <= 45 else "NEUTRAL"
 
 
-# ============================================================
-# 10) STOCHASTIC STATE
-# ============================================================
-
-def classify_stochastic(
-    k: float,
-    d: float,
-) -> str:
-
-    if (
-        pd.isna(k)
-        or pd.isna(d)
-    ):
-
+def classify_stochastic(k: float, d: float) -> str:
+    if not all(finite(v) for v in [k, d]):
         return "UNKNOWN"
-
-    if (
-        k <= 20
-        and d <= 20
-    ):
-
+    if k <= 20 and d <= 20:
         return "OVERSOLD"
-
-    if (
-        k >= 80
-        and d >= 80
-    ):
-
+    if k >= 80 and d >= 80:
         return "OVERBOUGHT"
-
-    if k > d:
-
-        return "BULLISH"
-
-    if k < d:
-
-        return "BEARISH"
-
-    return "NEUTRAL"
+    return "BULLISH" if k > d else "BEARISH" if k < d else "NEUTRAL"
 
 
-# ============================================================
-# 11) DRAWDOWN STATE
-# ============================================================
-
-def classify_drawdown(
-    drawdown: float,
-) -> str:
-
-    if pd.isna(
-        drawdown
-    ):
-
+def classify_williams_r(wr: float) -> str:
+    if not finite(wr):
         return "UNKNOWN"
-
-    if drawdown <= -0.40:
-
-        return "DEEP_CRASH"
-
-    if drawdown <= -0.30:
-
-        return "DEEP_DRAWDOWN"
-
-    if drawdown <= -0.20:
-
-        return "MAJOR_DRAWDOWN"
-
-    if drawdown <= -0.10:
-
-        return "CORRECTION"
-
-    if drawdown >= -0.03:
-
-        return "NEAR_52W_HIGH"
-
-    return "NORMAL"
+    if wr <= -80:
+        return "OVERSOLD"
+    if wr >= -20:
+        return "OVERBOUGHT"
+    return "BULLISH" if wr > -50 else "BEARISH" if wr < -50 else "NEUTRAL"
 
 
-# ============================================================
-# 12) COMPONENT SCORES
-# ============================================================
-
-def trend_score(
-    price: float,
-    ma50: float,
-    ma200: float,
-) -> float:
-
-    if any(
-        pd.isna(x)
-        for x in [
-            price,
-            ma50,
-            ma200,
-        ]
-    ):
-
-        return 0.0
-
-    score = 0.0
-
-    if price > ma200:
-
-        score += 12.0
-
-    if price > ma50:
-
-        score += 8.0
-
-    if ma50 > ma200:
-
-        score += 10.0
-
-    return score
+def classify_drawdown(drawdown: float) -> str:
+    if not finite(drawdown):
+        return "UNKNOWN"
+    for boundary, state in [(-.40, "DEEP_CRASH"), (-.30, "DEEP_DRAWDOWN"),
+                            (-.20, "MAJOR_DRAWDOWN"), (-.10, "CORRECTION")]:
+        if drawdown <= boundary:
+            return state
+    return "NEAR_52W_HIGH" if drawdown >= -.03 else "NORMAL"
 
 
-def momentum_score(
-    momentum_3m: float,
-    momentum_6m: float,
-) -> float:
-
-    score = 0.0
-
-    if pd.notna(
-        momentum_3m
-    ):
-
-        if momentum_3m >= 0.15:
-
-            score += 10
-
-        elif momentum_3m >= 0.05:
-
-            score += 8
-
-        elif momentum_3m >= 0:
-
-            score += 6
-
-        elif momentum_3m >= -0.10:
-
-            score += 3
-
-    if pd.notna(
-        momentum_6m
-    ):
-
-        if momentum_6m >= 0.25:
-
-            score += 10
-
-        elif momentum_6m >= 0.10:
-
-            score += 8
-
-        elif momentum_6m >= 0:
-
-            score += 6
-
-        elif momentum_6m >= -0.15:
-
-            score += 3
-
-    return score
+# Original scoring rules, including all thresholds, retained for valid data.
+# Missing indicators now return NaN instead of an artificial zero score.
+def trend_score(price: float, ma50: float, ma200: float) -> float:
+    if not all(finite(v) for v in [price, ma50, ma200]):
+        return np.nan
+    return float(12 * (price > ma200) + 8 * (price > ma50) + 10 * (ma50 > ma200))
 
 
-def rsi_score(
-    rsi: float,
-) -> float:
+def momentum_score(momentum_3m: float, momentum_6m: float) -> float:
+    if not all(finite(v) for v in [momentum_3m, momentum_6m]):
+        return np.nan
+    def points(value: float, upper: float, middle: float, bottom: float) -> float:
+        if value >= upper:
+            return 10.0
+        if value >= middle:
+            return 8.0
+        if value >= 0:
+            return 6.0
+        return 3.0 if value >= bottom else 0.0
+    return points(momentum_3m, .15, .05, -.10) + points(momentum_6m, .25, .10, -.15)
 
-    if pd.isna(
-        rsi
-    ):
 
-        return 0.0
-
+def rsi_score(rsi: float) -> float:
+    if not finite(rsi):
+        return np.nan
     if 50 <= rsi <= 65:
-
         return 15.0
-
     if 40 <= rsi < 50:
-
         return 12.0
-
-    if 30 <= rsi < 40:
-
+    if 30 <= rsi < 40 or 65 < rsi <= 70:
         return 10.0
-
-    if 65 < rsi <= 70:
-
-        return 10.0
-
     if rsi < 30:
-
         return 8.0
-
-    if 70 < rsi <= 75:
-
-        return 6.0
-
-    return 3.0
+    return 6.0 if 70 < rsi <= 75 else 3.0
 
 
-def stochastic_score(
-    k: float,
-    d: float,
-    bullish_cross: bool,
-    bearish_cross: bool,
-) -> float:
-
-    if (
-        pd.isna(k)
-        or pd.isna(d)
-    ):
-
-        return 0.0
-
-    score = 0.0
-
-    if bullish_cross:
-
-        score += 10.0
-
-    elif bearish_cross:
-
-        score += 0.0
-
-    elif k > d:
-
-        score += 7.0
-
-    else:
-
-        score += 4.0
-
-    if (
-        k <= 30
-        and k > d
-    ):
-
-        score += 5.0
-
-    elif (
-        k >= 80
-        and k < d
-    ):
-
-        score += 0.0
-
-    else:
-
-        score += 3.0
-
-    return min(
-        score,
-        15.0,
-    )
+def stochastic_score(k: float, d: float, bullish_cross: bool, bearish_cross: bool) -> float:
+    if not all(finite(v) for v in [k, d]):
+        return np.nan
+    score = 10.0 if bullish_cross else 0.0 if bearish_cross else 7.0 if k > d else 4.0
+    score += 5.0 if k <= 30 and k > d else 0.0 if k >= 80 and k < d else 3.0
+    return min(score, 15.0)
 
 
-def volume_score(
-    volume_ratio: float,
-    daily_return: float,
-) -> float:
-
-    if pd.isna(
-        volume_ratio
-    ):
-
-        return 0.0
-
-    if (
-        volume_ratio >= 1.5
-        and daily_return > 0
-    ):
-
+def volume_score(volume_ratio: float, daily_return: float) -> float:
+    if not all(finite(v) for v in [volume_ratio, daily_return]) or volume_ratio < 0:
+        return np.nan
+    if volume_ratio >= 1.5 and daily_return > 0:
         return 10.0
-
-    if (
-        volume_ratio >= 1.2
-        and daily_return > 0
-    ):
-
+    if volume_ratio >= 1.2 and daily_return > 0:
         return 8.0
-
-    if volume_ratio >= 0.8:
-
-        return 6.0
-
-    return 4.0
+    return 6.0 if volume_ratio >= .8 else 4.0
 
 
-# ============================================================
-# 13) TECHNICAL SCORE
-# ============================================================
-
-def calculate_total_technical_score(
-    trend_points: float,
-    momentum_points: float,
-    rsi_points: float,
-    stochastic_points: float,
-    volume_points: float,
-) -> float:
-
-    # Trend       30
-    # Momentum    20
-    # RSI         15
-    # Stochastic  15
-    # Volume      10
-    #
-    # 현재 합계 최대 90점이므로
-    # 100점 만점으로 normalize
-
-    raw = (
-        trend_points
-        + momentum_points
-        + rsi_points
-        + stochastic_points
-        + volume_points
-    )
-
-    normalized = (
-        raw
-        / 90.0
-        * 100.0
-    )
-
-    return float(
-        np.clip(
-            normalized,
-            0,
-            100,
-        )
-    )
+def calculate_total_technical_score(trend_points: float, momentum_points: float,
+                                    rsi_points: float, stochastic_points: float,
+                                    volume_points: float) -> float:
+    values = [trend_points, momentum_points, rsi_points, stochastic_points, volume_points]
+    if not all(finite(v) for v in values):
+        return np.nan
+    return float(np.clip(sum(values) / 90 * 100, 0, 100))
 
 
-# ============================================================
-# 14) TECHNICAL GRADE
-# ============================================================
-
-def technical_grade(
-    score: float,
-) -> str:
-
-    if pd.isna(
-        score
-    ):
-
+def technical_grade(score: float) -> str:
+    if not finite(score):
         return "N/A"
-
-    if score >= 85:
-
-        return "A"
-
-    if score >= 75:
-
-        return "B+"
-
-    if score >= 65:
-
-        return "B"
-
-    if score >= 55:
-
-        return "C+"
-
-    if score >= 45:
-
-        return "C"
-
-    if score >= 35:
-
-        return "D"
-
+    for threshold, grade in [(85, "A"), (75, "B+"), (65, "B"), (55, "C+"), (45, "C"), (35, "D")]:
+        if score >= threshold:
+            return grade
     return "F"
 
 
-# ============================================================
-# 15) TECHNICAL STATE
-# ============================================================
-
-def technical_state(
-    price: float,
-    ma50: float,
-    ma200: float,
-    rsi: float,
-    momentum_6m: float,
-    drawdown: float,
-    bullish_cross: bool,
-    bearish_cross: bool,
-) -> str:
-
-    if (
-        pd.notna(rsi)
-        and rsi >= 75
-        and pd.notna(drawdown)
-        and drawdown >= -0.05
-    ):
-
+def technical_state(price: float, ma50: float, ma200: float, rsi: float,
+                    momentum_6m: float, drawdown: float, bullish_cross: bool,
+                    bearish_cross: bool) -> str:
+    if finite(rsi) and rsi >= 75 and finite(drawdown) and drawdown >= -.05:
         return "OVERHEATED"
-
-    if (
-        bullish_cross
-        and pd.notna(drawdown)
-        and drawdown <= -0.10
-    ):
-
+    if bullish_cross and finite(drawdown) and drawdown <= -.10:
         return "RECOVERY"
-
-    if (
-        pd.notna(rsi)
-        and rsi <= 30
-    ):
-
+    if finite(rsi) and rsi <= 30:
         return "OVERSOLD"
-
-    if (
-        pd.notna(price)
-        and pd.notna(ma50)
-        and pd.notna(ma200)
-        and price > ma50 > ma200
-        and pd.notna(momentum_6m)
-        and momentum_6m > 0
-    ):
-
+    if all(finite(v) for v in [price, ma50, ma200, momentum_6m]) and price > ma50 > ma200 and momentum_6m > 0:
         return "STRONG_UPTREND"
-
-    if (
-        pd.notna(price)
-        and pd.notna(ma200)
-        and price > ma200
-    ):
-
+    if finite(price) and finite(ma200) and price > ma200:
         return "UPTREND"
-
-    if (
-        bearish_cross
-        and pd.notna(price)
-        and pd.notna(ma50)
-        and price < ma50
-    ):
-
+    if bearish_cross and finite(price) and finite(ma50) and price < ma50:
         return "WEAKENING"
-
-    if (
-        pd.notna(price)
-        and pd.notna(ma50)
-        and pd.notna(ma200)
-        and price < ma50 < ma200
-    ):
-
+    if all(finite(v) for v in [price, ma50, ma200]) and price < ma50 < ma200:
         return "STRONG_DOWNTREND"
-
-    if (
-        pd.notna(price)
-        and pd.notna(ma200)
-        and price < ma200
-    ):
-
-        return "DOWNTREND"
-
-    return "NEUTRAL"
-
-
-# ============================================================
-# 16) ANALYZE ONE STOCK
-# ============================================================
-
-def analyze_stock(
-    ticker: str,
-    prices: pd.DataFrame,
-) -> dict[str, t.Any]:
-
-    output = {
-
-        "Ticker":
-            ticker,
-
-        "Technical Data Quality":
-            "FAILED",
-
-        "Price":
-            np.nan,
-
-        "Daily Return":
-            np.nan,
-
-        "MA50":
-            np.nan,
-
-        "MA200":
-            np.nan,
-
-        "Price vs MA50":
-            np.nan,
-
-        "Price vs MA200":
-            np.nan,
-
-        "RSI14":
-            np.nan,
-
-        "Stoch K":
-            np.nan,
-
-        "Stoch D":
-            np.nan,
-
-        "Stoch Bullish Cross":
-            False,
-
-        "Stoch Bearish Cross":
-            False,
-
-        "Momentum 3M":
-            np.nan,
-
-        "Momentum 6M":
-            np.nan,
-
-        "52W High":
-            np.nan,
-
-        "52W Drawdown":
-            np.nan,
-
-        "Volume":
-            np.nan,
-
-        "Volume 20D Avg":
-            np.nan,
-
-        "Volume Ratio":
-            np.nan,
-
-        "Trend State":
-            "UNKNOWN",
-
-        "RSI State":
-            "UNKNOWN",
-
-        "Stochastic State":
-            "UNKNOWN",
-
-        "Drawdown State":
-            "UNKNOWN",
-
-        "Trend Score":
-            0.0,
-
-        "Momentum Score":
-            0.0,
-
-        "RSI Score":
-            0.0,
-
-        "Stochastic Score":
-            0.0,
-
-        "Volume Score":
-            0.0,
-
-        "Technical Score":
-            0.0,
-
-        "Technical Grade":
-            "N/A",
-
-        "Technical State":
-            "UNKNOWN",
-
-        "Technical Failed Reason":
-            None,
-    }
-
-    try:
-
-        df = extract_ticker_frame(
-            prices,
-            ticker,
-        )
-
-        if len(df) < MA_LONG:
-
-            output[
-                "Technical Data Quality"
-            ] = "PARTIAL"
-
-            output[
-                "Technical Failed Reason"
-            ] = (
-                "MA200 계산에 필요한 "
-                "가격 데이터가 부족합니다."
-            )
-
-            return output
-
-        df = add_indicators(
-            df
-        )
-
-        latest = df.iloc[-1]
-
-        price = latest[
-            "Close"
-        ]
-
-        ma50 = latest[
-            "MA50"
-        ]
-
-        ma200 = latest[
-            "MA200"
-        ]
-
-        rsi = latest[
-            "RSI14"
-        ]
-
-        k = latest[
-            "Stoch K"
-        ]
-
-        d = latest[
-            "Stoch D"
-        ]
-
-        momentum_3m = latest[
-            "Momentum 3M"
-        ]
-
-        momentum_6m = latest[
-            "Momentum 6M"
-        ]
-
-        drawdown = latest[
-            "52W Drawdown"
-        ]
-
-        bullish_cross = (
-            crossed_above(
-                df[
-                    "Stoch K"
-                ],
-                df[
-                    "Stoch D"
-                ],
-            )
-            and
-            pd.notna(k)
-            and k <= 30
-        )
-
-        bearish_cross = (
-            crossed_below(
-                df[
-                    "Stoch K"
-                ],
-                df[
-                    "Stoch D"
-                ],
-            )
-            and
-            pd.notna(k)
-            and k >= 70
-        )
-
-        t_score = trend_score(
-            price,
-            ma50,
-            ma200,
-        )
-
-        m_score = momentum_score(
-            momentum_3m,
-            momentum_6m,
-        )
-
-        r_score = rsi_score(
-            rsi
-        )
-
-        s_score = stochastic_score(
-            k,
-            d,
-            bullish_cross,
-            bearish_cross,
-        )
-
-        v_score = volume_score(
-            latest[
-                "Volume Ratio"
-            ],
-            latest[
-                "Daily Return"
-            ],
-        )
-
-        total_score = (
-            calculate_total_technical_score(
-                t_score,
-                m_score,
-                r_score,
-                s_score,
-                v_score,
-            )
-        )
-
-        output.update(
-            {
-
-                "Technical Data Quality":
-                    "OK",
-
-                "Price":
-                    price,
-
-                "Daily Return":
-                    latest[
-                        "Daily Return"
-                    ],
-
-                "MA50":
-                    ma50,
-
-                "MA200":
-                    ma200,
-
-                "Price vs MA50":
-                    (
-                        price / ma50 - 1
-                        if pd.notna(ma50)
-                        and ma50 != 0
-                        else np.nan
-                    ),
-
-                "Price vs MA200":
-                    (
-                        price / ma200 - 1
-                        if pd.notna(ma200)
-                        and ma200 != 0
-                        else np.nan
-                    ),
-
-                "RSI14":
-                    rsi,
-
-                "Stoch K":
-                    k,
-
-                "Stoch D":
-                    d,
-
-                "Stoch Bullish Cross":
-                    bullish_cross,
-
-                "Stoch Bearish Cross":
-                    bearish_cross,
-
-                "Momentum 3M":
-                    momentum_3m,
-
-                "Momentum 6M":
-                    momentum_6m,
-
-                "52W High":
-                    latest[
-                        "52W High"
-                    ],
-
-                "52W Drawdown":
-                    drawdown,
-
-                "Volume":
-                    latest[
-                        "Volume"
-                    ],
-
-                "Volume 20D Avg":
-                    latest[
-                        "Volume 20D Avg"
-                    ],
-
-                "Volume Ratio":
-                    latest[
-                        "Volume Ratio"
-                    ],
-
-                "Trend State":
-                    classify_trend(
-                        price,
-                        ma50,
-                        ma200,
-                        momentum_6m,
-                    ),
-
-                "RSI State":
-                    classify_rsi(
-                        rsi
-                    ),
-
-                "Stochastic State":
-                    classify_stochastic(
-                        k,
-                        d,
-                    ),
-
-                "Drawdown State":
-                    classify_drawdown(
-                        drawdown
-                    ),
-
-                "Trend Score":
-                    t_score,
-
-                "Momentum Score":
-                    m_score,
-
-                "RSI Score":
-                    r_score,
-
-                "Stochastic Score":
-                    s_score,
-
-                "Volume Score":
-                    v_score,
-
-                "Technical Score":
-                    round(
-                        total_score,
-                        2,
-                    ),
-
-                "Technical Grade":
-                    technical_grade(
-                        total_score
-                    ),
-
-                "Technical State":
-                    technical_state(
-                        price,
-                        ma50,
-                        ma200,
-                        rsi,
-                        momentum_6m,
-                        drawdown,
-                        bullish_cross,
-                        bearish_cross,
-                    ),
-            }
-        )
-
-    except Exception as exc:
-
-        output[
-            "Technical Failed Reason"
-        ] = (
-            f"{type(exc).__name__}: "
-            f"{exc}"
-        )
-
-    return output
-
-
-# ============================================================
-# 17) RUN ENGINE
-# ============================================================
-
-def run_technical_engine(
-    fundamentals: pd.DataFrame,
-    prices: pd.DataFrame,
-) -> pd.DataFrame:
-
-    tickers = (
-        fundamentals[
-            "Ticker"
-        ]
-        .dropna()
-        .astype(str)
-        .tolist()
-    )
-
-    rows = []
-
-    print()
-    print(
-        "📈 Technical Engine 실행..."
-    )
-
-    total = len(
-        tickers
-    )
-
-    for index, ticker in enumerate(
-        tickers,
-        start=1,
-    ):
-
-        row = analyze_stock(
-            ticker,
-            prices,
-        )
-
-        rows.append(
-            row
-        )
-
-        if (
-            index % 25 == 0
-            or index == total
-        ):
-
-            print(
-                f"Technical 분석: "
-                f"{index}/{total}"
-            )
-
-    technical_df = pd.DataFrame(
-        rows
-    )
-
-    return fundamentals.merge(
-        technical_df,
-        on="Ticker",
-        how="left",
-    )
-
-
-# ============================================================
-# 18) TECHNICAL RANK
-# ============================================================
-
-def add_technical_rank(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
+    return "DOWNTREND" if finite(price) and finite(ma200) and price < ma200 else "NEUTRAL"
+
+
+def calculate_seasonality(close: pd.Series, as_of: t.Any) -> dict[str, t.Any]:
+    """Prototype calendar-month score, using only completed prior months.
+
+    Rank the target calendar month's mean return among 12 calendar months.
+    Shrink that rank toward 50 by n/(n+5). Require >=5 returns for EVERY month.
+    The score is not an expected return or an estimated win probability.
+    """
+    cutoff = utc_day(as_of).to_period("M")
+    out = {"Seasonality Score": np.nan, "Seasonality Data Quality": "INSUFFICIENT_HISTORY",
+           "Seasonality Month": cutoff.month, "Seasonality Samples": 0,
+           "Seasonality Mean Return": np.nan, "Seasonality Win Rate": np.nan,
+           "Seasonality Method": "MONTH_MEAN_RANK_SHRUNK_v1"}
+    series = close.copy().sort_index()
+    series.index = pd.DatetimeIndex(series.index).tz_localize(None)
+    series = series.loc[~series.index.duplicated(keep="last")]
+    series = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    series = series[(series > 0) & (series.index < cutoff.start_time)]
+    if series.empty:
+        return out
+    frame = pd.DataFrame({"close": series, "date": series.index}, index=series.index)
+    monthly = frame.groupby(frame.index.to_period("M")).agg(
+        close=("close", "last"), first=("date", "min"), last=("date", "max"), count=("close", "size"))
+    monthly = monthly.reindex(pd.period_range(monthly.index.min(), cutoff - 1, freq="M"))
+    # Reject partial IPO months, sparse months and missing adjacent months.
+    full = ((monthly["count"] >= 10) & (monthly["first"].dt.day <= 7)
+            & ((monthly.index.days_in_month - monthly["last"].dt.day) <= 7))
+    returns = monthly["close"].pct_change(fill_method=None).where(full & full.shift(1, fill_value=False))
+    returns = returns[(returns.index >= cutoff - 12 * SEASONALITY_YEARS) & (returns.index < cutoff)].dropna()
+    if returns.empty:
+        return out
+    counts = returns.groupby(returns.index.month).count().reindex(range(1, 13), fill_value=0)
+    target = returns[returns.index.month == cutoff.month]
+    out.update({"Seasonality Samples": len(target),
+                "Seasonality Mean Return": float(target.mean()) if len(target) else np.nan,
+                "Seasonality Win Rate": float((target > 0).mean()) if len(target) else np.nan})
+    if counts.min() < SEASONALITY_MIN_SAMPLES:
+        return out
+    means = returns.groupby(returns.index.month).mean().reindex(range(1, 13))
+    raw = float((means.rank(method="average").loc[cutoff.month] - 1) / 11 * 100)
+    reliability = len(target) / (len(target) + SEASONALITY_SHRINKAGE)
+    out["Seasonality Score"] = round(50 + reliability * (raw - 50), 2)
+    out["Seasonality Data Quality"] = "OK"
+    return out
+
+
+def load_cycle_scores(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        print(f"ℹ️ 순환 데이터 없음: {path} (종합점수는 자료 부족으로 표시)")
+        return pd.DataFrame()
+    frame = pd.read_csv(path)
+    needed = {"Cycle Score", "Cycle As Of", "Cycle Source"}
+    if not needed.issubset(frame.columns) or not ({"Ticker", "Sector"} & set(frame.columns)):
+        raise ValueError("순환 CSV에는 Ticker 또는 Sector 및 Cycle Score, Cycle As Of, Cycle Source가 필요합니다.")
+    return frame
+
+
+def resolve_cycle_score(row: pd.Series, external: pd.DataFrame, as_of: t.Any) -> dict[str, t.Any]:
+    out = {"Cycle Score": np.nan, "Cycle Data Quality": "MISSING",
+           "Cycle As Of": "", "Cycle Source": "", "Cycle Notes": ""}
+    if pd.isna(as_of) or not str(as_of).strip():
+        return out
+    date = utc_day(as_of)
+    candidates: list[dict[str, t.Any]] = []
+    if finite(row.get("Cycle Score")):
+        candidates.append({**{k: row.get(k) for k in out}, "_priority": 1})
+    if not external.empty:
+        ticker = str(row["Ticker"]).strip().upper()
+        sector = str(row.get("Sector", "")).strip().casefold()
+        for record in external.to_dict("records"):
+            rt = str(record.get("Ticker", "")).strip().upper()
+            rs = str(record.get("Sector", "")).strip().casefold()
+            if rt == ticker:
+                candidates.append({**record, "_priority": 2})
+            elif rt in {"", "NAN", "<NA>"} and sector not in {"", "nan", "unknown"} and rs == sector:
+                candidates.append({**record, "_priority": 0})
+    if not candidates:
+        return out
+    admissible = []
+    for candidate in candidates:
+        stamp = pd.to_datetime(candidate.get("Cycle As Of"), errors="coerce", utc=True)
+        if not pd.isna(stamp) and utc_day(stamp) <= date:
+            admissible.append({**candidate, "_date": utc_day(stamp)})
+    if not admissible:
+        out["Cycle Data Quality"] = "FUTURE_OR_INVALID_DATE"
+        return out
+    # A ticker-specific record overrides a generic sector record. Never silently
+    # replace its stale/invalid newest record with an older, more favorable one.
+    top_priority = max(c["_priority"] for c in admissible)
+    selected = [c for c in admissible if c["_priority"] == top_priority]
+    latest_date = max(c["_date"] for c in selected)
+    selected = [c for c in selected if c["_date"] == latest_date]
+    if len(selected) != 1:
+        out["Cycle Data Quality"] = "DUPLICATE_RECORDS"
+        return out
+    record = selected[0]
+    source = record.get("Cycle Source")
+    if not valid_score(record.get("Cycle Score")) or pd.isna(source) or not str(source).strip():
+        out["Cycle Data Quality"] = "INVALID_SCORE_OR_SOURCE"
+        return out
+    out.update({"Cycle As Of": latest_date.strftime("%Y-%m-%d"),
+                "Cycle Source": str(source).strip(),
+                "Cycle Notes": "" if pd.isna(record.get("Cycle Notes")) else str(record["Cycle Notes"])})
+    if (date - latest_date).days > CYCLE_MAX_AGE_DAYS:
+        out["Cycle Data Quality"] = "STALE"
+        return out
+    out.update({"Cycle Score": float(record["Cycle Score"]), "Cycle Data Quality": "OK"})
+    return out
+
+
+def add_combined_scores(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
-
-    result[
-        "Technical Rank"
-    ] = (
-        result[
-            "Technical Score"
-        ]
-        .rank(
-            ascending=False,
-            method="min",
-        )
-        .astype(
-            "Int64"
-        )
-    )
-
+    missing = pd.Series("", index=result.index, dtype="string")
+    valid = pd.Series(True, index=result.index)
+    total = pd.Series(0.0, index=result.index)
+    for column, weight in WEIGHTS.items():
+        values = pd.to_numeric(result.get(column, pd.Series(np.nan, index=result.index)), errors="coerce")
+        ok = values.map(valid_score)
+        quality = {"Technical Score": "Technical Data Quality", "Cycle Score": "Cycle Data Quality",
+                   "Seasonality Score": "Seasonality Data Quality"}.get(column)
+        if quality is not None:
+            ok &= result.get(quality, pd.Series("MISSING", index=result.index)).eq("OK")
+        valid &= ok
+        missing = missing.mask(~ok, missing + column + "; ")
+        result[column.replace(" Score", " Contribution")] = (values * weight).where(ok)
+        total += values.fillna(0) * weight
+    result["Combined Score"] = total.where(valid).round(2)
+    result["Combined Data Quality"] = np.where(valid, "OK", "INCOMPLETE")
+    result["Combined Missing Inputs"] = missing.str.rstrip("; ")
+    result["Combined Rank"] = result["Combined Score"].rank(ascending=False, method="min").astype("Int64")
+    result["Score Model"] = SCORE_MODEL
     return result
 
 
-# ============================================================
-# 19) SAVE
-# ============================================================
+def empty_technical_output(ticker: str) -> dict[str, t.Any]:
+    numeric = ["Price", "Daily Return", "MA50", "MA200", "Price vs MA50", "Price vs MA200", "RSI14",
+               "Stoch K", "Stoch D", "Williams %R", "Oscillator Identity Error", "Momentum 3M", "Momentum 6M",
+               "52W High", "52W Drawdown", "Volume", "Volume 20D Avg", "Volume Ratio", "Trend Score",
+               "Momentum Score", "RSI Score", "Stochastic Score", "Volume Score", "Technical Score"]
+    output: dict[str, t.Any] = dict.fromkeys(numeric, np.nan)
+    output.update({"Ticker": ticker, "Technical Data Quality": "FAILED", "Technical Grade": "N/A",
+                   "Technical Failed Reason": "", "Technical As Of": "", "Stoch Bullish Cross": False,
+                   "Stoch Bearish Cross": False, "Williams Oversold Exit": False, "Williams Overbought Exit": False,
+                   "Oscillator Confirmation": "UNKNOWN", "Technical State": "UNKNOWN", "Trend State": "UNKNOWN",
+                   "RSI State": "UNKNOWN", "Stochastic State": "UNKNOWN", "Williams State": "UNKNOWN",
+                   "Drawdown State": "UNKNOWN", "Seasonality Score": np.nan,
+                   "Seasonality Data Quality": "INSUFFICIENT_HISTORY", "Seasonality Month": np.nan,
+                   "Seasonality Samples": 0, "Seasonality Mean Return": np.nan,
+                   "Seasonality Win Rate": np.nan, "Seasonality Method": "MONTH_MEAN_RANK_SHRUNK_v1"})
+    return output
 
-def save_phase3(
-    df: pd.DataFrame,
-) -> Path:
 
-    today = datetime.now().strftime(
-        "%Y-%m-%d"
-    )
+def analyze_stock(ticker: str, prices: pd.DataFrame, as_of: t.Any = None) -> dict[str, t.Any]:
+    output = empty_technical_output(ticker)
+    try:
+        cutoff = utc_day(as_of)
+        df = extract_ticker_frame(prices, ticker)
+        if df.empty:
+            raise ValueError("유효한 가격 데이터가 없습니다.")
+        df = df.loc[df.index < cutoff]  # Reproducible as-of cutoff; no unfinished bar.
+        if df.empty:
+            raise ValueError("유효한 가격 데이터가 없습니다.")
+        output["Technical As Of"] = df.index[-1].strftime("%Y-%m-%d")
+        output.update(calculate_seasonality(df["Close"], df.index[-1]))
+        if len(df) < MA_LONG:
+            output.update({"Technical Data Quality": "PARTIAL", "Technical Failed Reason": "MA200 계산에 200거래일이 필요합니다."})
+            return output
+        if (cutoff - df.index[-1]).days > PRICE_MAX_AGE_DAYS:
+            output.update({"Technical Data Quality": "STALE", "Technical Failed Reason": "최근 가격이 7일 이상 오래되었습니다."})
+            return output
+        recent = df.tail(HIGH_52W_DAYS)
+        tolerance = recent["Close"].abs() * 1e-8
+        bad = ((recent["Close"] <= 0) | (recent["Volume"] < 0)
+               | (recent["High"] < recent["Low"])
+               | (recent["Close"] > recent["High"] + tolerance)
+               | (recent["Close"] < recent["Low"] - tolerance))
+        if bad.any():
+            output.update({"Technical Data Quality": "INVALID", "Technical Failed Reason": "최근 가격/거래량 데이터가 유효하지 않습니다."})
+            return output
+        df = add_indicators(df)
+        last = df.iloc[-1]
+        price, ma50, ma200 = last["Close"], last["MA50"], last["MA200"]
+        rsi, k, d, wr = last["RSI14"], last["Stoch K"], last["Stoch D"], last["Williams %R"]
+        m3, m6, drawdown = last["Momentum 3M"], last["Momentum 6M"], last["52W Drawdown"]
+        bull = crossed_above(df["Stoch K"], df["Stoch D"]) and finite(k) and k <= 30
+        bear = crossed_below(df["Stoch K"], df["Stoch D"]) and finite(k) and k >= 70
+        scores = [trend_score(price, ma50, ma200), momentum_score(m3, m6), rsi_score(rsi),
+                  stochastic_score(k, d, bull, bear), volume_score(last["Volume Ratio"], last["Daily Return"])]
+        total = calculate_total_technical_score(*scores)
+        for column in output.keys() & set(last.index):
+            output[column] = last[column]
+        output.update(dict(zip(["Trend Score", "Momentum Score", "RSI Score", "Stochastic Score", "Volume Score"], scores)))
+        output.update({"Price": price, "Price vs MA50": price / ma50 - 1 if ma50 != 0 else np.nan,
+                       "Price vs MA200": price / ma200 - 1 if ma200 != 0 else np.nan,
+                       "Stoch Bullish Cross": bool(bull), "Stoch Bearish Cross": bool(bear),
+                       "Williams Oversold Exit": crossed_above(df["Williams %R"], pd.Series(-80., index=df.index)),
+                       "Williams Overbought Exit": crossed_below(df["Williams %R"], pd.Series(-20., index=df.index)),
+                       "Trend State": classify_trend(price, ma50, ma200, m6), "RSI State": classify_rsi(rsi),
+                       "Stochastic State": classify_stochastic(k, d), "Williams State": classify_williams_r(wr),
+                       "Drawdown State": classify_drawdown(drawdown), "Technical Score": round(total, 2),
+                       "Technical Grade": technical_grade(total),
+                       "Technical State": technical_state(price, ma50, ma200, rsi, m6, drawdown, bull, bear),
+                       "Technical Data Quality": "OK" if finite(total) else "PARTIAL",
+                       "Technical Failed Reason": "" if finite(total) else "기술지표 계산에 필요한 데이터 일부가 없습니다."})
+        if finite(k) and finite(wr):
+            if STOCH_K_PERIOD == WILLIAMS_PERIOD:
+                error = abs(wr - (k - 100))
+                output["Oscillator Identity Error"] = error
+                output["Oscillator Confirmation"] = "REDUNDANT_SAME_WINDOW" if error < 1e-8 else "CHECK_DATA"
+            else:
+                output["Oscillator Confirmation"] = "DIFFERENT_WINDOWS_NOT_INDEPENDENT"
+    except Exception as exc:
+        output["Technical Failed Reason"] = f"{type(exc).__name__}: {exc}"
+    return output
 
-    path = (
-        DATA_DIR
-        / (
-            "sp500_technical_scores_"
-            f"{today}.csv"
-        )
-    )
 
-    output = df.sort_values(
-        by=[
-            "Fundamental Score",
-            "Technical Score",
-        ],
-        ascending=[
-            False,
-            False,
-        ],
-        na_position="last",
-    )
+def run_technical_engine(fundamentals: pd.DataFrame, prices: pd.DataFrame,
+                         cycle_scores: pd.DataFrame | None = None, as_of: t.Any = None) -> pd.DataFrame:
+    fundamentals = normalize_tickers(fundamentals)
+    if not isinstance(prices.columns, pd.MultiIndex) and len(fundamentals) > 1:
+        raise ValueError("복수 종목 분석에는 ticker가 포함된 MultiIndex 가격 데이터가 필요합니다.")
+    external = cycle_scores if cycle_scores is not None else pd.DataFrame()
+    rows = []
+    for index, (_, fundamental) in enumerate(fundamentals.iterrows(), start=1):
+        technical = analyze_stock(str(fundamental["Ticker"]), prices, as_of=as_of)
+        row = fundamental.to_dict()
+        row.update(technical)
+        row.update(resolve_cycle_score(fundamental, external, row["Technical As Of"]))
+        rows.append(row)
+        if index % 25 == 0 or index == len(fundamentals):
+            print(f"Technical 분석: {index}/{len(fundamentals)}")
+    result = add_technical_rank(pd.DataFrame(rows))
+    return add_combined_scores(result)
 
-    output.to_csv(
-        path,
-        index=False,
-        encoding="utf-8-sig",
-    )
 
+def add_technical_rank(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    result["Technical Rank"] = result["Technical Score"].rank(ascending=False, method="min").astype("Int64")
+    return result
+
+
+def save_phase3(df: pd.DataFrame) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / f"sp500_technical_scores_{datetime.now():%Y-%m-%d}.csv"
+    df.sort_values(["Combined Score", "Fundamental Score", "Technical Score"],
+                   ascending=False, na_position="last").to_csv(path, index=False, encoding="utf-8-sig")
     return path
 
 
-# ============================================================
-# 20) PRINT SUMMARY
-# ============================================================
-
-def print_summary(
-    df: pd.DataFrame,
-) -> None:
-
-    print()
-    print(
-        "=" * 80
-    )
-
-    print(
-        "TECHNICAL ENGINE SUMMARY"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        f"총 종목: {len(df)}"
-    )
-
-    print(
-        f"평균 Technical Score: "
-        f"{df['Technical Score'].mean():.2f}"
-    )
-
-    print(
-        f"70점 이상: "
-        f"{(df['Technical Score'] >= 70).sum()}"
-    )
-
-    print(
-        f"80점 이상: "
-        f"{(df['Technical Score'] >= 80).sum()}"
-    )
-
-    print()
-
-    print(
-        "Technical State:"
-    )
-
-    print(
-        df[
-            "Technical State"
-        ]
-        .value_counts(
-            dropna=False
-        )
-        .to_string()
-    )
-
-    print()
+def reweight_phase4(phase4_path: Path, phase3_path: Path) -> Path:
+    """Explicit post-Phase-4 step. Preserve signals and fundamentals; back up CSV."""
+    p4 = normalize_tickers(pd.read_csv(phase4_path))
+    p3 = normalize_tickers(pd.read_csv(phase3_path))
+    date3 = re.search(r"_(\d{4}-\d{2}-\d{2})\.csv$", phase3_path.name)
+    date4 = re.search(r"_(\d{4}-\d{2}-\d{2})\.csv$", phase4_path.name)
+    if not date3 or not date4 or date3[1] != date4[1]:
+        raise ValueError("같은 YYYY-MM-DD 날짜의 Phase 3/4 결과 파일이 필요합니다.")
+    if p3.empty or "Score Model" not in p3 or not p3["Score Model"].eq(SCORE_MODEL).all():
+        raise ValueError("새 버전 Phase 3 결과 파일이 필요합니다.")
+    missing = set(p4["Ticker"]) - set(p3["Ticker"])
+    if missing:
+        raise ValueError(f"Phase 3에 없는 종목이 있습니다: {sorted(missing)[:5]}")
+    indexed = p3.set_index("Ticker").reindex(p4["Ticker"])
+    old_f = pd.to_numeric(p4["Fundamental Score"], errors="coerce").to_numpy(dtype=float)
+    new_f = pd.to_numeric(indexed["Fundamental Score"], errors="coerce").to_numpy(dtype=float)
+    if not np.allclose(old_f, new_f, equal_nan=True, atol=1e-8, rtol=0):
+        raise ValueError("두 파일의 펀더멘털 점수가 다릅니다. 같은 입력으로 Phase 3와 Phase 4를 다시 실행하세요.")
+    generated = set(empty_technical_output("_schema")) - {"Ticker"}
+    generated |= {"Cycle Score", "Cycle Data Quality", "Cycle As Of", "Cycle Source", "Cycle Notes", "Technical Rank"}
+    for column in generated & set(indexed.columns):
+        p4[column] = indexed[column].to_numpy()
+    p4 = add_combined_scores(p4)
+    p4 = p4.sort_values(["Combined Score", "Fundamental Score", "Technical Score"], ascending=False, na_position="last")
+    if "Display Rank" in p4:
+        p4["Display Rank"] = p4["Combined Rank"].to_numpy()
+    if "Recommendation Rank" in p4:
+        p4["Recommendation Rank"] = p4["Combined Rank"].to_numpy()
+    backup = phase4_path.with_name(phase4_path.name + f".{uuid4().hex[:8]}.bak")
+    temporary = phase4_path.with_name(phase4_path.name + ".tmp")
+    shutil.copy2(phase4_path, backup)
+    try:
+        p4.to_csv(temporary, index=False, encoding="utf-8-sig")
+        temporary.replace(phase4_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(f"✅ Phase 4 점수 재적용: {phase4_path}\n원본 백업: {backup}")
+    print("참고: 기존 Signal/Confidence는 유지되며 새 가중치로 재판정하지 않습니다.")
+    return phase4_path
 
 
-# ============================================================
-# 21) PRINT TOP STOCKS
-# ============================================================
-
-def print_top_stocks(
-    df: pd.DataFrame,
-    top_n: int = 20,
-) -> None:
-
-    columns = [
-        "Ticker",
-        "Short Name",
-        "Fundamental Score",
-        "Technical Score",
-        "Technical Grade",
-        "Technical State",
-        "Trend State",
-        "Price",
-        "RSI14",
-        "Momentum 6M",
-        "52W Drawdown",
-    ]
-
-    columns = [
-        column
-        for column in columns
-        if column in df.columns
-    ]
-
-    top = (
-        df
-        .sort_values(
-            "Technical Score",
-            ascending=False,
-        )
-        .head(
-            top_n
-        )
-    )
-
-    print(
-        "=" * 130
-    )
-
-    print(
-        f"TOP {top_n} TECHNICAL STOCKS"
-    )
-
-    print(
-        "=" * 130
-    )
-
-    print(
-        top[
-            columns
-        ].to_string(
-            index=False
-        )
-    )
-
-    print()
+def print_summary(df: pd.DataFrame) -> None:
+    print(f"총 종목: {len(df)} | 평균 Technical: {df['Technical Score'].mean():.2f}")
+    complete = df["Combined Data Quality"].eq("OK")
+    print(f"종합점수 계산 가능: {int(complete.sum())}/{len(df)} (F50/T30/C15/S5)")
+    if not complete.all():
+        print("자료 부족으로 종합점수가 비어 있는 항목:")
+        print(df.loc[~complete, "Combined Missing Inputs"].value_counts().to_string())
 
 
-# ============================================================
-# 22) MAIN
-# ============================================================
+def print_top_stocks(df: pd.DataFrame, top_n: int = 20) -> None:
+    ready = df[df["Combined Data Quality"].eq("OK")]
+    columns = ["Ticker", "Fundamental Score", "Technical Score", "Cycle Score", "Seasonality Score", "Combined Score"]
+    if ready.empty:
+        print("종합 추천 순위 없음: 순환/계절성 등 누락된 입력을 확인하세요.")
+        return
+    print(ready.sort_values("Combined Score", ascending=False).head(top_n)[columns].to_string(index=False))
+
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cycle-file", type=Path, default=DATA_DIR / "cycle_scores.csv")
+    parser.add_argument("--reweight-phase4", metavar="CSV_OR_latest",
+                        help="Phase 4 실행 뒤 종합점수만 재적용합니다. 원본 CSV를 백업 후 교체합니다.")
+    parser.add_argument("--phase3-file", type=Path, help="재가중할 때 사용할 Phase 3 CSV (생략: 최신 파일)")
+    args = parser.parse_args()
+    if args.reweight_phase4:
+        path = latest_file(PHASE4_PATTERN) if args.reweight_phase4 == "latest" else Path(args.reweight_phase4)
+        reweight_phase4(path, args.phase3_file or latest_file(PHASE3_PATTERN))
+        return
+    fundamentals, source = load_phase2_data()
+    cycles = load_cycle_scores(args.cycle_file)
+    prices = download_price_data(fundamentals["Ticker"].astype(str).tolist())
+    result = run_technical_engine(fundamentals, prices, cycles)
+    path = save_phase3(result)
+    print_summary(result)
+    print_top_stocks(result)
+    print(f"📂 Source: {source}\n💾 저장 완료: {path}")
+    print("Phase 4 실행 후: python phase3_technical.py --reweight-phase4 latest")
 
-    print()
-    print(
-        "=============================================="
-    )
-
-    print(
-        "        AI VALUE STOCK RADAR"
-    )
-
-    print(
-        "        PHASE 3 - TECHNICAL ENGINE"
-    )
-
-    print(
-        "=============================================="
-    )
-
-    print()
-
-    fundamentals, source_path = (
-        load_phase2_data()
-    )
-
-    tickers = (
-        fundamentals[
-            "Ticker"
-        ]
-        .dropna()
-        .astype(str)
-        .tolist()
-    )
-
-    print(
-        f"✅ 분석 대상: "
-        f"{len(tickers)}개"
-    )
-
-    prices = download_price_data(
-        tickers
-    )
-
-    result = run_technical_engine(
-        fundamentals,
-        prices,
-    )
-
-    result = add_technical_rank(
-        result
-    )
-
-    output_path = save_phase3(
-        result
-    )
-
-    print_summary(
-        result
-    )
-
-    print_top_stocks(
-        result,
-        top_n=20,
-    )
-
-    print(
-        f"📂 Source: "
-        f"{source_path}"
-    )
-
-    print(
-        f"💾 저장 완료: "
-        f"{output_path}"
-    )
-
-    print()
-
-    print(
-        "✅ PHASE 3 COMPLETE"
-    )
-
-    print()
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     main()
