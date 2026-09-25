@@ -1160,66 +1160,6 @@ def add_rankings(
 
 
 # ============================================================
-# 13) QUALITY VALUE TAG
-# ============================================================
-
-def quality_value_signal(
-    row: pd.Series,
-) -> str:
-
-    fundamental = to_float(
-        row.get(
-            "Fundamental Score"
-        )
-    )
-
-    value = to_float(
-        row.get(
-            "Value Score"
-        )
-    )
-
-    quality = to_float(
-        row.get(
-            "Quality Score"
-        )
-    )
-
-    if (
-        fundamental is None
-        or value is None
-        or quality is None
-    ):
-        return ""
-
-    if (
-        fundamental >= 80
-        and value >= 27
-        and quality >= 23
-    ):
-
-        return "QUALITY_VALUE"
-
-    return ""
-
-
-def add_quality_value_signal(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
-    result = df.copy()
-
-    result[
-        "Quality Value Signal"
-    ] = result.apply(
-        quality_value_signal,
-        axis=1,
-    )
-
-    return result
-
-
-# ============================================================
 # 14) COLUMN ORDER
 # ============================================================
 
@@ -1245,7 +1185,6 @@ def reorder_columns(
         "Stability Score",
 
         "Sector Fundamental Rank",
-        "Quality Value Signal",
 
         "Forward PER",
         "PBR",
@@ -1410,10 +1349,6 @@ def print_summary(
         f" {(df['Fundamental Score'] >= 70).sum()}"
     )
 
-    print(
-        f"Quality Value:"
-        f" {(df['Quality Value Signal'] == 'QUALITY_VALUE').sum()}"
-    )
 
     print()
 
@@ -1438,7 +1373,6 @@ def print_top_stocks(
         "Quality Score",
         "Growth Score",
         "Stability Score",
-        "Quality Value Signal",
     ]
 
     columns = [
@@ -1573,16 +1507,6 @@ def main() -> None:
 
     result = add_rankings(
         result
-    )
-
-    # --------------------------------------------------------
-    # Quality Value
-    # --------------------------------------------------------
-
-    result = (
-        add_quality_value_signal(
-            result
-        )
     )
 
     # --------------------------------------------------------

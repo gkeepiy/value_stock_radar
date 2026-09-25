@@ -15,6 +15,7 @@ PHASE4_PATTERN = "sp500_radar_signals_*.csv"
 SCORE_LABELS = {"Fundamental Score": "펀더멘털", "Technical Score": "기술적 분석"}
 LABELS = {"Display Rank": "순위", "Ticker": "종목", "Short Name": "기업명",
           "Sector": "업종", "Combined Score": "종합점수", "Price": "주가",
+          "52W Drawdown": "52주 고점 대비", "Sideways 31D Range": "최근 31거래일 종가 범위",
           "Currency": "통화", "Technical As Of": "가격 기준일",
           "Combined Missing Inputs": "부족한 평가 항목", **SCORE_LABELS}
 STATE_LABELS = {"STRONG_UPTREND": "강한 상승 추세", "UPTREND": "상승 추세",
@@ -58,6 +59,7 @@ def find_latest_phase4_file() -> Path:
 def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     result = normalize_tickers(df)
     numeric = list(WEIGHTS) + ["Price", "RSI14", "Stoch K", "Stoch D", "Williams %R", "Momentum 3M",
+              "Sideways 31D Range",
               "Momentum 6M", "52W Drawdown", "MA50", "MA200", "Volume Ratio", "Value Score", "Quality Score",
               "Growth Score", "Stability Score", "PBR", "Forward PER", "PSR", "EV/EBITDA", "FCF Yield",
               "ROE", "ROA", "Debt/Equity", "Operating Margin", "Profit Margin", "Trend Score",
@@ -111,7 +113,8 @@ def split_recommendations(df: pd.DataFrame, min_combined: float = 0) -> tuple[pd
 
 def display_table(df: pd.DataFrame, pending=False) -> pd.DataFrame:
     columns = (["Ticker", "Short Name"] if pending else ["Display Rank", "Ticker", "Short Name"])
-    columns += ["Combined Score", *WEIGHTS, "Sector", "Price", "Currency", "Technical As Of"]
+    columns += ["Combined Score", *WEIGHTS, "52W Drawdown", "Sideways 31D Range",
+                "Sector", "Price", "Currency", "Technical As Of"]
     if pending:
         columns += ["Combined Missing Inputs"]
     table = df[[c for c in columns if c in df]].copy()
@@ -155,6 +158,7 @@ def show_technical(row: pd.Series) -> None:
                   ("Williams %R", "Williams %R", "number")])
     st.write(f"스토캐스틱: {state_text(row.get('Stochastic State'))} · Williams %R: {state_text(row.get('Williams State'))}")
     st.caption("Williams %R은 보조 확인용입니다. 같은 14기간 Fast %K와 중복되는 정보이므로 추가 가점이 없습니다.")
+    metrics(row, [("Sideways 31D Range", "최근 31거래일 종가 범위", "percent")])
     if row.get("Oscillator Confirmation") == "CHECK_DATA":
         st.warning("두 오실레이터의 계산값이 일치하지 않아 원자료 확인이 필요합니다.")
 
@@ -207,15 +211,22 @@ def show_stock_recommendations(raw_df: pd.DataFrame, source_path: Path) -> None:
     min_f = st.sidebar.slider("최소 펀더멘털 점수", 0, 100, 0)
     min_t = st.sidebar.slider("최소 기술적 점수", 0, 100, 0)
     min_c = st.sidebar.slider("최소 종합점수", 0, 100, 0)
+    base_only = st.sidebar.checkbox("Drawdown Base 신호 종목만 보기", value=True)
     limit = st.sidebar.selectbox("표시 종목 수", [30, 50, 100, "전체"])
     filtered = filter_rows(raw_df, sectors, search, min_f, min_t)
     ready, pending = split_recommendations(filtered, min_c)
+    if base_only:
+        flag = ready.get("Signal Drawdown Base", pd.Series(False, index=ready.index))
+        ready = ready.loc[flag.fillna(False).astype(bool)].copy()
+        ready["Display Rank"] = np.arange(1, len(ready) + 1)
+        pending = pending.iloc[:0]
     boxes = st.columns(3)
     boxes[0].metric("추천 조건 충족", len(ready))
     boxes[1].metric("평균 종합점수", number_text(ready["Combined Score"].mean()))
     boxes[2].metric("자료 부족", len(pending))
     if ready.empty:
-        st.info("현재 필터에서 펀더멘털·기술 점수를 모두 갖춘 종목이 없습니다.")
+        st.info("해당 조건을 충족한 종목이 없습니다." if base_only else
+                "현재 필터에서 펀더멘털·기술 점수를 모두 갖춘 종목이 없습니다.")
     else:
         shown = ready if limit == "전체" else ready.head(int(limit))
         st.dataframe(display_table(shown), hide_index=True, width="stretch", height=520)

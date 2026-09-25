@@ -3,13 +3,12 @@ from __future__ import annotations
 """AI Value Stock Radar — Phase 3.
 
 Run: python phase3_technical.py
-After Phase 4: python phase3_technical.py --reweight-phase4 latest
+Next: python phase4_signal.py (uses the same weighted scoring function)
 
 Fundamental scores are preserved. Technical scoring retains the original
 30/20/15/15/10 allocation (90 raw points, normalized to 100).
-Williams %R is informational only. Combined Score requires all four inputs;
-missing cycle/seasonality data is never replaced with an invented score.
-See README_KO.md for the external cycle input and seasonality assumptions.
+Williams %R is informational only. Combined Score requires valid fundamental
+and technical scores, at a 5:3 ratio.
 """
 
 import argparse
@@ -27,7 +26,7 @@ DATA_DIR = Path("data")
 PHASE2_PATTERN = "sp500_fundamental_scores_*.csv"
 PHASE3_PATTERN = "sp500_technical_scores_*.csv"
 PHASE4_PATTERN = "sp500_radar_signals_*.csv"
-PRICE_PERIOD = "10y"  # Long enough for calendar-month seasonality.
+PRICE_PERIOD = "2y"
 PRICE_INTERVAL = "1d"
 RSI_PERIOD = 14
 STOCH_K_PERIOD = 14
@@ -36,15 +35,11 @@ WILLIAMS_PERIOD = 14
 MA_SHORT, MA_LONG = 50, 200
 MOMENTUM_3M_DAYS, MOMENTUM_6M_DAYS = 63, 126
 HIGH_52W_DAYS = 252
+SIDEWAYS_SESSIONS = 31  # More than 30 completed trading sessions.
 VOLUME_PERIOD = 20
-SEASONALITY_YEARS = 10
-SEASONALITY_MIN_SAMPLES = 5
-SEASONALITY_SHRINKAGE = 5.0
-CYCLE_MAX_AGE_DAYS = 120
 PRICE_MAX_AGE_DAYS = 7
-SCORE_MODEL = "F50_T30_C15_S5_v1"
-WEIGHTS = {"Fundamental Score": 0.50, "Technical Score": 0.30,
-           "Cycle Score": 0.15, "Seasonality Score": 0.05}
+SCORE_MODEL = "F5_T3_v2"
+WEIGHTS = {"Fundamental Score": 5 / 8, "Technical Score": 3 / 8}
 OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 
 
@@ -356,115 +351,6 @@ def technical_state(price: float, ma50: float, ma200: float, rsi: float,
     return "DOWNTREND" if finite(price) and finite(ma200) and price < ma200 else "NEUTRAL"
 
 
-def calculate_seasonality(close: pd.Series, as_of: t.Any) -> dict[str, t.Any]:
-    """Prototype calendar-month score, using only completed prior months.
-
-    Rank the target calendar month's mean return among 12 calendar months.
-    Shrink that rank toward 50 by n/(n+5). Require >=5 returns for EVERY month.
-    The score is not an expected return or an estimated win probability.
-    """
-    cutoff = utc_day(as_of).to_period("M")
-    out = {"Seasonality Score": np.nan, "Seasonality Data Quality": "INSUFFICIENT_HISTORY",
-           "Seasonality Month": cutoff.month, "Seasonality Samples": 0,
-           "Seasonality Mean Return": np.nan, "Seasonality Win Rate": np.nan,
-           "Seasonality Method": "MONTH_MEAN_RANK_SHRUNK_v1"}
-    series = close.copy().sort_index()
-    series.index = pd.DatetimeIndex(series.index).tz_localize(None)
-    series = series.loc[~series.index.duplicated(keep="last")]
-    series = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    series = series[(series > 0) & (series.index < cutoff.start_time)]
-    if series.empty:
-        return out
-    frame = pd.DataFrame({"close": series, "date": series.index}, index=series.index)
-    monthly = frame.groupby(frame.index.to_period("M")).agg(
-        close=("close", "last"), first=("date", "min"), last=("date", "max"), count=("close", "size"))
-    monthly = monthly.reindex(pd.period_range(monthly.index.min(), cutoff - 1, freq="M"))
-    # Reject partial IPO months, sparse months and missing adjacent months.
-    full = ((monthly["count"] >= 10) & (monthly["first"].dt.day <= 7)
-            & ((monthly.index.days_in_month - monthly["last"].dt.day) <= 7))
-    returns = monthly["close"].pct_change(fill_method=None).where(full & full.shift(1, fill_value=False))
-    returns = returns[(returns.index >= cutoff - 12 * SEASONALITY_YEARS) & (returns.index < cutoff)].dropna()
-    if returns.empty:
-        return out
-    counts = returns.groupby(returns.index.month).count().reindex(range(1, 13), fill_value=0)
-    target = returns[returns.index.month == cutoff.month]
-    out.update({"Seasonality Samples": len(target),
-                "Seasonality Mean Return": float(target.mean()) if len(target) else np.nan,
-                "Seasonality Win Rate": float((target > 0).mean()) if len(target) else np.nan})
-    if counts.min() < SEASONALITY_MIN_SAMPLES:
-        return out
-    means = returns.groupby(returns.index.month).mean().reindex(range(1, 13))
-    raw = float((means.rank(method="average").loc[cutoff.month] - 1) / 11 * 100)
-    reliability = len(target) / (len(target) + SEASONALITY_SHRINKAGE)
-    out["Seasonality Score"] = round(50 + reliability * (raw - 50), 2)
-    out["Seasonality Data Quality"] = "OK"
-    return out
-
-
-def load_cycle_scores(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        print(f"ℹ️ 순환 데이터 없음: {path} (종합점수는 자료 부족으로 표시)")
-        return pd.DataFrame()
-    frame = pd.read_csv(path)
-    needed = {"Cycle Score", "Cycle As Of", "Cycle Source"}
-    if not needed.issubset(frame.columns) or not ({"Ticker", "Sector"} & set(frame.columns)):
-        raise ValueError("순환 CSV에는 Ticker 또는 Sector 및 Cycle Score, Cycle As Of, Cycle Source가 필요합니다.")
-    return frame
-
-
-def resolve_cycle_score(row: pd.Series, external: pd.DataFrame, as_of: t.Any) -> dict[str, t.Any]:
-    out = {"Cycle Score": np.nan, "Cycle Data Quality": "MISSING",
-           "Cycle As Of": "", "Cycle Source": "", "Cycle Notes": ""}
-    if pd.isna(as_of) or not str(as_of).strip():
-        return out
-    date = utc_day(as_of)
-    candidates: list[dict[str, t.Any]] = []
-    if finite(row.get("Cycle Score")):
-        candidates.append({**{k: row.get(k) for k in out}, "_priority": 1})
-    if not external.empty:
-        ticker = str(row["Ticker"]).strip().upper()
-        sector = str(row.get("Sector", "")).strip().casefold()
-        for record in external.to_dict("records"):
-            rt = str(record.get("Ticker", "")).strip().upper()
-            rs = str(record.get("Sector", "")).strip().casefold()
-            if rt == ticker:
-                candidates.append({**record, "_priority": 2})
-            elif rt in {"", "NAN", "<NA>"} and sector not in {"", "nan", "unknown"} and rs == sector:
-                candidates.append({**record, "_priority": 0})
-    if not candidates:
-        return out
-    admissible = []
-    for candidate in candidates:
-        stamp = pd.to_datetime(candidate.get("Cycle As Of"), errors="coerce", utc=True)
-        if not pd.isna(stamp) and utc_day(stamp) <= date:
-            admissible.append({**candidate, "_date": utc_day(stamp)})
-    if not admissible:
-        out["Cycle Data Quality"] = "FUTURE_OR_INVALID_DATE"
-        return out
-    # A ticker-specific record overrides a generic sector record. Never silently
-    # replace its stale/invalid newest record with an older, more favorable one.
-    top_priority = max(c["_priority"] for c in admissible)
-    selected = [c for c in admissible if c["_priority"] == top_priority]
-    latest_date = max(c["_date"] for c in selected)
-    selected = [c for c in selected if c["_date"] == latest_date]
-    if len(selected) != 1:
-        out["Cycle Data Quality"] = "DUPLICATE_RECORDS"
-        return out
-    record = selected[0]
-    source = record.get("Cycle Source")
-    if not valid_score(record.get("Cycle Score")) or pd.isna(source) or not str(source).strip():
-        out["Cycle Data Quality"] = "INVALID_SCORE_OR_SOURCE"
-        return out
-    out.update({"Cycle As Of": latest_date.strftime("%Y-%m-%d"),
-                "Cycle Source": str(source).strip(),
-                "Cycle Notes": "" if pd.isna(record.get("Cycle Notes")) else str(record["Cycle Notes"])})
-    if (date - latest_date).days > CYCLE_MAX_AGE_DAYS:
-        out["Cycle Data Quality"] = "STALE"
-        return out
-    out.update({"Cycle Score": float(record["Cycle Score"]), "Cycle Data Quality": "OK"})
-    return out
-
-
 def add_combined_scores(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     missing = pd.Series("", index=result.index, dtype="string")
@@ -473,8 +359,10 @@ def add_combined_scores(df: pd.DataFrame) -> pd.DataFrame:
     for column, weight in WEIGHTS.items():
         values = pd.to_numeric(result.get(column, pd.Series(np.nan, index=result.index)), errors="coerce")
         ok = values.map(valid_score)
-        quality = {"Technical Score": "Technical Data Quality", "Cycle Score": "Cycle Data Quality",
-                   "Seasonality Score": "Seasonality Data Quality"}.get(column)
+        if column == "Fundamental Score" and "Data Quality" in result:
+            # Phase 2 can score a failed Phase 1 download as zero; it is missing data.
+            ok &= ~result["Data Quality"].astype("string").str.upper().eq("FAILED").fillna(False)
+        quality = {"Technical Score": "Technical Data Quality"}.get(column)
         if quality is not None:
             ok &= result.get(quality, pd.Series("MISSING", index=result.index)).eq("OK")
         valid &= ok
@@ -492,7 +380,7 @@ def add_combined_scores(df: pd.DataFrame) -> pd.DataFrame:
 def empty_technical_output(ticker: str) -> dict[str, t.Any]:
     numeric = ["Price", "Daily Return", "MA50", "MA200", "Price vs MA50", "Price vs MA200", "RSI14",
                "Stoch K", "Stoch D", "Williams %R", "Oscillator Identity Error", "Momentum 3M", "Momentum 6M",
-               "52W High", "52W Drawdown", "Volume", "Volume 20D Avg", "Volume Ratio", "Trend Score",
+               "52W High", "52W Drawdown", "Sideways 31D Range", "Volume", "Volume 20D Avg", "Volume Ratio", "Trend Score",
                "Momentum Score", "RSI Score", "Stochastic Score", "Volume Score", "Technical Score"]
     output: dict[str, t.Any] = dict.fromkeys(numeric, np.nan)
     output.update({"Ticker": ticker, "Technical Data Quality": "FAILED", "Technical Grade": "N/A",
@@ -500,10 +388,7 @@ def empty_technical_output(ticker: str) -> dict[str, t.Any]:
                    "Stoch Bearish Cross": False, "Williams Oversold Exit": False, "Williams Overbought Exit": False,
                    "Oscillator Confirmation": "UNKNOWN", "Technical State": "UNKNOWN", "Trend State": "UNKNOWN",
                    "RSI State": "UNKNOWN", "Stochastic State": "UNKNOWN", "Williams State": "UNKNOWN",
-                   "Drawdown State": "UNKNOWN", "Seasonality Score": np.nan,
-                   "Seasonality Data Quality": "INSUFFICIENT_HISTORY", "Seasonality Month": np.nan,
-                   "Seasonality Samples": 0, "Seasonality Mean Return": np.nan,
-                   "Seasonality Win Rate": np.nan, "Seasonality Method": "MONTH_MEAN_RANK_SHRUNK_v1"})
+                   "Drawdown State": "UNKNOWN"})
     return output
 
 
@@ -518,7 +403,6 @@ def analyze_stock(ticker: str, prices: pd.DataFrame, as_of: t.Any = None) -> dic
         if df.empty:
             raise ValueError("유효한 가격 데이터가 없습니다.")
         output["Technical As Of"] = df.index[-1].strftime("%Y-%m-%d")
-        output.update(calculate_seasonality(df["Close"], df.index[-1]))
         if len(df) < MA_LONG:
             output.update({"Technical Data Quality": "PARTIAL", "Technical Failed Reason": "MA200 계산에 200거래일이 필요합니다."})
             return output
@@ -534,6 +418,10 @@ def analyze_stock(ticker: str, prices: pd.DataFrame, as_of: t.Any = None) -> dic
         if bad.any():
             output.update({"Technical Data Quality": "INVALID", "Technical Failed Reason": "최근 가격/거래량 데이터가 유효하지 않습니다."})
             return output
+        # The entire trailing 31 completed sessions must fit inside a 10% close range.
+        if len(df) >= SIDEWAYS_SESSIONS:
+            window = df["Close"].tail(SIDEWAYS_SESSIONS)
+            output["Sideways 31D Range"] = float(window.max() / window.min() - 1)
         df = add_indicators(df)
         last = df.iloc[-1]
         price, ma50, ma200 = last["Close"], last["MA50"], last["MA200"]
@@ -572,17 +460,15 @@ def analyze_stock(ticker: str, prices: pd.DataFrame, as_of: t.Any = None) -> dic
 
 
 def run_technical_engine(fundamentals: pd.DataFrame, prices: pd.DataFrame,
-                         cycle_scores: pd.DataFrame | None = None, as_of: t.Any = None) -> pd.DataFrame:
+                         as_of: t.Any = None) -> pd.DataFrame:
     fundamentals = normalize_tickers(fundamentals)
     if not isinstance(prices.columns, pd.MultiIndex) and len(fundamentals) > 1:
         raise ValueError("복수 종목 분석에는 ticker가 포함된 MultiIndex 가격 데이터가 필요합니다.")
-    external = cycle_scores if cycle_scores is not None else pd.DataFrame()
     rows = []
     for index, (_, fundamental) in enumerate(fundamentals.iterrows(), start=1):
         technical = analyze_stock(str(fundamental["Ticker"]), prices, as_of=as_of)
         row = fundamental.to_dict()
         row.update(technical)
-        row.update(resolve_cycle_score(fundamental, external, row["Technical As Of"]))
         rows.append(row)
         if index % 25 == 0 or index == len(fundamentals):
             print(f"Technical 분석: {index}/{len(fundamentals)}")
@@ -623,7 +509,7 @@ def reweight_phase4(phase4_path: Path, phase3_path: Path) -> Path:
     if not np.allclose(old_f, new_f, equal_nan=True, atol=1e-8, rtol=0):
         raise ValueError("두 파일의 펀더멘털 점수가 다릅니다. 같은 입력으로 Phase 3와 Phase 4를 다시 실행하세요.")
     generated = set(empty_technical_output("_schema")) - {"Ticker"}
-    generated |= {"Cycle Score", "Cycle Data Quality", "Cycle As Of", "Cycle Source", "Cycle Notes", "Technical Rank"}
+    generated |= {"Technical Rank"}
     for column in generated & set(indexed.columns):
         p4[column] = indexed[column].to_numpy()
     p4 = add_combined_scores(p4)
@@ -648,7 +534,7 @@ def reweight_phase4(phase4_path: Path, phase3_path: Path) -> Path:
 def print_summary(df: pd.DataFrame) -> None:
     print(f"총 종목: {len(df)} | 평균 Technical: {df['Technical Score'].mean():.2f}")
     complete = df["Combined Data Quality"].eq("OK")
-    print(f"종합점수 계산 가능: {int(complete.sum())}/{len(df)} (F50/T30/C15/S5)")
+    print(f"종합점수 계산 가능: {int(complete.sum())}/{len(df)} (펀더멘털 62.5% / 기술 37.5%)")
     if not complete.all():
         print("자료 부족으로 종합점수가 비어 있는 항목:")
         print(df.loc[~complete, "Combined Missing Inputs"].value_counts().to_string())
@@ -656,16 +542,15 @@ def print_summary(df: pd.DataFrame) -> None:
 
 def print_top_stocks(df: pd.DataFrame, top_n: int = 20) -> None:
     ready = df[df["Combined Data Quality"].eq("OK")]
-    columns = ["Ticker", "Fundamental Score", "Technical Score", "Cycle Score", "Seasonality Score", "Combined Score"]
+    columns = ["Ticker", "Fundamental Score", "Technical Score", "Combined Score"]
     if ready.empty:
-        print("종합 추천 순위 없음: 순환/계절성 등 누락된 입력을 확인하세요.")
+        print("종합 추천 순위 없음: 펀더멘털·기술 점수를 확인하세요.")
         return
     print(ready.sort_values("Combined Score", ascending=False).head(top_n)[columns].to_string(index=False))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cycle-file", type=Path, default=DATA_DIR / "cycle_scores.csv")
     parser.add_argument("--reweight-phase4", metavar="CSV_OR_latest",
                         help="Phase 4 실행 뒤 종합점수만 재적용합니다. 원본 CSV를 백업 후 교체합니다.")
     parser.add_argument("--phase3-file", type=Path, help="재가중할 때 사용할 Phase 3 CSV (생략: 최신 파일)")
@@ -675,14 +560,13 @@ def main() -> None:
         reweight_phase4(path, args.phase3_file or latest_file(PHASE3_PATTERN))
         return
     fundamentals, source = load_phase2_data()
-    cycles = load_cycle_scores(args.cycle_file)
     prices = download_price_data(fundamentals["Ticker"].astype(str).tolist())
-    result = run_technical_engine(fundamentals, prices, cycles)
+    result = run_technical_engine(fundamentals, prices)
     path = save_phase3(result)
     print_summary(result)
     print_top_stocks(result)
     print(f"📂 Source: {source}\n💾 저장 완료: {path}")
-    print("Phase 4 실행 후: python phase3_technical.py --reweight-phase4 latest")
+    print("다음 실행: python phase4_signal.py (별도 재가중 명령 불필요)")
 
 
 if __name__ == "__main__":

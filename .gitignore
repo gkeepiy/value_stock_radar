@@ -2,3 +2,7 @@
 
 data/portfolio.csv
 .streamlit/secrets.toml
+
+__pycache__/
+
+__pycache__/
