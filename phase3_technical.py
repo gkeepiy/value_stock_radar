@@ -14,6 +14,7 @@ and technical scores, at a 5:3 ratio.
 import argparse
 import re
 import shutil
+import time
 import typing as t
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,9 @@ PHASE3_PATTERN = "sp500_technical_scores_*.csv"
 PHASE4_PATTERN = "sp500_radar_signals_*.csv"
 PRICE_PERIOD = "2y"
 PRICE_INTERVAL = "1d"
+PRICE_BATCH_SIZE = 40
+PRICE_BATCH_RETRIES = 2
+MIN_PRICE_COVERAGE = 0.80
 RSI_PERIOD = 14
 STOCH_K_PERIOD = 14
 STOCH_D_PERIOD = 3
@@ -100,18 +104,82 @@ def download_price_data(tickers: list[str]) -> pd.DataFrame:
         import yfinance as yf
     except ImportError as exc:
         raise RuntimeError("먼저 pip install numpy pandas yfinance 를 실행하세요.") from exc
-    print(f"📡 {len(tickers)}개 종목: {PRICE_PERIOD} 일별 가격 다운로드")
-    # end is exclusive. Exclude today's possibly unfinished daily bar.
-    prices = yf.download(tickers=tickers, period=PRICE_PERIOD,
-                         end=utc_day().strftime("%Y-%m-%d"), interval=PRICE_INTERVAL,
-                         auto_adjust=True, group_by="ticker", threads=True,
-                         progress=True)
-    if prices is None or prices.empty:
-        raise RuntimeError("가격 데이터를 다운로드하지 못했습니다.")
-    if not isinstance(prices.columns, pd.MultiIndex) and len(tickers) != 1:
-        raise ValueError("여러 종목의 가격 데이터에 종목별 열 구분이 없습니다.")
-    if len(tickers) == 1:
-        prices.attrs["single_ticker"] = tickers[0]
+    symbols = list(dict.fromkeys(str(t).strip().upper() for t in tickers if str(t).strip()))
+    if not symbols:
+        raise ValueError("가격 데이터를 요청할 Ticker가 없습니다.")
+
+    print(f"📡 {len(symbols)}개 종목: {PRICE_PERIOD} 일별 가격 다운로드")
+    end = utc_day().strftime("%Y-%m-%d")  # end is exclusive; omit today's unfinished bar.
+    downloaded: dict[str, pd.DataFrame] = {}
+    errors: list[str] = []
+
+    def fetch_batch(batch: list[str]) -> dict[str, pd.DataFrame]:
+        """Download one bounded batch and return only tickers with usable OHLCV."""
+        try:
+            frame = yf.download(
+                tickers=batch,
+                period=PRICE_PERIOD,
+                end=end,
+                interval=PRICE_INTERVAL,
+                auto_adjust=True,
+                group_by="ticker",
+                threads=min(5, len(batch)),
+                progress=False,
+            )
+        except Exception as exc:
+            errors.append(f"{batch[0]}..{batch[-1]}: {type(exc).__name__}: {exc}")
+            return {}
+
+        if frame is None or frame.empty:
+            return {}
+        # A flat-column result is unambiguous only for a one-ticker request.
+        if not isinstance(frame.columns, pd.MultiIndex):
+            if len(batch) != 1:
+                errors.append(f"{batch[0]}..{batch[-1]}: 응답에 Ticker별 열 구분이 없습니다.")
+                return {}
+            frame.attrs["single_ticker"] = batch[0]
+
+        good: dict[str, pd.DataFrame] = {}
+        for ticker in batch:
+            ticker_frame = extract_ticker_frame(frame, ticker)
+            if not ticker_frame.empty:
+                good[ticker] = ticker_frame
+        return good
+
+    batches = [symbols[i:i + PRICE_BATCH_SIZE] for i in range(0, len(symbols), PRICE_BATCH_SIZE)]
+    for batch_number, batch in enumerate(batches, start=1):
+        found = fetch_batch(batch)
+        downloaded.update(found)
+        missing = [ticker for ticker in batch if ticker not in found]
+        # Retry only missing symbols. Splitting a huge universe into bounded requests
+        # avoids Yahoo throttling and makes transient failures recoverable.
+        for attempt in range(1, PRICE_BATCH_RETRIES + 1):
+            if not missing:
+                break
+            time.sleep(1.0 * attempt)
+            retry_found = fetch_batch(missing)
+            downloaded.update(retry_found)
+            missing = [ticker for ticker in missing if ticker not in retry_found]
+        print(f"가격 다운로드 묶음 {batch_number}/{len(batches)}: 성공 {len(batch) - len(missing)}/{len(batch)}")
+        if batch_number < len(batches):
+            time.sleep(0.25)
+
+    coverage = len(downloaded) / len(symbols)
+    if not downloaded:
+        detail = errors[-1] if errors else "Yahoo Finance가 비어 있는 가격 데이터를 반환했습니다."
+        raise RuntimeError(f"가격 데이터를 하나도 받지 못했습니다. 마지막 오류: {detail}")
+    if coverage < MIN_PRICE_COVERAGE:
+        missing_sample = [ticker for ticker in symbols if ticker not in downloaded][:10]
+        raise RuntimeError(
+            f"가격 데이터 수집 성공률이 {coverage:.1%}로 기준 {MIN_PRICE_COVERAGE:.0%}보다 낮습니다. "
+            f"오류가 많은 Phase 3 CSV 저장을 중단했습니다. 누락 예시: {', '.join(missing_sample)}. "
+            "잠시 후 다시 실행하거나 Ticker 표기를 확인하세요."
+        )
+
+    print(f"✅ 가격 데이터 수집: {len(downloaded)}/{len(symbols)} ({coverage:.1%})")
+    # Always return ticker-first MultiIndex, including one-symbol inputs.
+    prices = pd.concat(downloaded, axis=1)
+    prices.columns = pd.MultiIndex.from_tuples(prices.columns, names=["Ticker", "Field"])
     return prices
 
 

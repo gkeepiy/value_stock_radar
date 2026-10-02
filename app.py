@@ -11,9 +11,10 @@ import streamlit as st
 from phase3_technical import WEIGHTS, add_combined_scores, finite, normalize_tickers
 
 DATA_DIR = Path("data")
-PHASE4_PATTERN = "sp500_radar_signals_*.csv"
+PHASE3_PATTERN = "sp500_technical_scores_*.csv"
+INDEX_OPTIONS = ["전체", "S&P 500", "Russell 2000"]
 SCORE_LABELS = {"Fundamental Score": "펀더멘털", "Technical Score": "기술적 분석"}
-LABELS = {"Display Rank": "순위", "Ticker": "종목", "Short Name": "기업명",
+LABELS = {"Display Rank": "순위", "Ticker": "종목", "Short Name": "기업명", "Index": "지수",
           "Sector": "업종", "Combined Score": "종합점수", "Price": "주가",
           "52W Drawdown": "52주 고점 대비", "Sideways 31D Range": "최근 31거래일 종가 범위",
           "Currency": "통화", "Technical As Of": "가격 기준일",
@@ -49,10 +50,10 @@ def missing_text(value) -> str:
     return text.replace("; ", ", ")
 
 
-def find_latest_phase4_file() -> Path:
-    files = list(DATA_DIR.glob(PHASE4_PATTERN))
+def find_latest_phase3_file() -> Path:
+    files = list(DATA_DIR.glob(PHASE3_PATTERN))
     if not files:
-        raise FileNotFoundError("분석 결과 파일이 없습니다. Phase 3와 Phase 4를 실행해 주세요.")
+        raise FileNotFoundError("분석 결과 파일이 없습니다. Phase 1~3을 실행해 주세요.")
     return max(files, key=lambda p: (p.stat().st_mtime_ns, p.name))
 
 
@@ -79,13 +80,17 @@ def read_data(path: str, mtime_ns: int) -> pd.DataFrame:
 
 
 def load_data() -> tuple[pd.DataFrame, Path]:
-    path = find_latest_phase4_file()
+    path = find_latest_phase3_file()
     return read_data(str(path), path.stat().st_mtime_ns), path
 
 
-def filter_rows(df: pd.DataFrame, sectors: list[str] | None = None, search: str = "",
-                min_fundamental: float = 0, min_technical: float = 0) -> pd.DataFrame:
+def filter_rows(df: pd.DataFrame, index_name: str = "전체", sectors: list[str] | None = None,
+                search: str = "") -> pd.DataFrame:
     result = df.copy()
+    if index_name != "전체" and "Index" in result:
+        result = result[
+            result["Index"].fillna("").astype(str).str.contains(index_name, regex=False)
+        ]
     if sectors is not None and "Sector" in result:
         result = result[result["Sector"].fillna("미분류").astype(str).isin(sectors)]
     if search.strip():
@@ -94,29 +99,25 @@ def filter_rows(df: pd.DataFrame, sectors: list[str] | None = None, search: str 
         mask = result["Ticker"].str.casefold().str.contains(query, regex=False)
         mask |= company.str.casefold().str.contains(query, regex=False)
         result = result[mask]
-    for column, threshold in [("Fundamental Score", min_fundamental), ("Technical Score", min_technical)]:
-        if threshold > 0:
-            result = result[result[column].ge(threshold)]
     return result
 
 
-def split_recommendations(df: pd.DataFrame, min_combined: float = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ready = df["Combined Data Quality"].eq("OK") & df["Combined Score"].notna()
-    complete = df.loc[ready & df["Combined Score"].ge(min_combined)].copy()
-    complete = complete.sort_values(["Combined Score", "Fundamental Score", "Technical Score", "Ticker"],
-                                    ascending=[False, False, False, True])
-    complete["Display Rank"] = np.arange(1, len(complete) + 1)
-    pending = df.loc[~ready].copy()
-    pending["Display Rank"] = pd.NA
-    return complete, pending
+def sort_all_stocks(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.sort_values(
+        ["Combined Score", "Fundamental Score", "Technical Score", "Ticker"],
+        ascending=[False, False, False, True],
+        na_position="last",
+    ).copy()
+    scored = result["Combined Score"].notna()
+    result["Display Rank"] = pd.NA
+    result.loc[scored, "Display Rank"] = np.arange(1, int(scored.sum()) + 1)
+    return result
 
 
-def display_table(df: pd.DataFrame, pending=False) -> pd.DataFrame:
-    columns = (["Ticker", "Short Name"] if pending else ["Display Rank", "Ticker", "Short Name"])
-    columns += ["Combined Score", *WEIGHTS, "52W Drawdown", "Sideways 31D Range",
-                "Sector", "Price", "Currency", "Technical As Of"]
-    if pending:
-        columns += ["Combined Missing Inputs"]
+def display_table(df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Display Rank", "Ticker", "Short Name", "Index", "Combined Score", *WEIGHTS,
+               "52W Drawdown", "Sideways 31D Range", "Sector", "Price", "Currency",
+               "Technical As Of", "Combined Missing Inputs"]
     table = df[[c for c in columns if c in df]].copy()
     if "Combined Missing Inputs" in table:
         table["Combined Missing Inputs"] = table["Combined Missing Inputs"].map(missing_text)
@@ -200,47 +201,35 @@ def choose_stock(df: pd.DataFrame, key: str) -> pd.Series | None:
 
 
 def show_stock_recommendations(raw_df: pd.DataFrame, source_path: Path) -> None:
-    st.title("주식추천 레이더")
-    st.caption("펀더멘털 62.5% · 기술적 분석 37.5%")
+    st.title("전체 종목 종합점수")
+    st.caption("종합점수 내림차순 · 펀더멘털 62.5% · 기술적 분석 37.5%")
     st.sidebar.header("종목 필터")
+    index_name = st.sidebar.radio("지수", INDEX_OPTIONS, horizontal=True)
+    if index_name != "전체" and "Index" not in raw_df.columns:
+        st.warning("현재 데이터에 지수 구분(Index)이 없습니다. 최신 Phase 1 데이터로 다시 수집한 뒤 Phase 2~3을 실행해 주세요.")
+        return
     sectors = None
     if "Sector" in raw_df:
         choices = sorted(raw_df["Sector"].fillna("미분류").astype(str).unique())
         sectors = st.sidebar.multiselect("업종", choices, default=choices)
     search = st.sidebar.text_input("종목 코드 / 기업명")
-    min_f = st.sidebar.slider("최소 펀더멘털 점수", 0, 100, 0)
-    min_t = st.sidebar.slider("최소 기술적 점수", 0, 100, 0)
-    min_c = st.sidebar.slider("최소 종합점수", 0, 100, 0)
-    base_only = st.sidebar.checkbox("Drawdown Base 신호 종목만 보기", value=True)
-    limit = st.sidebar.selectbox("표시 종목 수", [30, 50, 100, "전체"])
-    filtered = filter_rows(raw_df, sectors, search, min_f, min_t)
-    ready, pending = split_recommendations(filtered, min_c)
-    if base_only:
-        flag = ready.get("Signal Drawdown Base", pd.Series(False, index=ready.index))
-        ready = ready.loc[flag.fillna(False).astype(bool)].copy()
-        ready["Display Rank"] = np.arange(1, len(ready) + 1)
-        pending = pending.iloc[:0]
+    limit = st.sidebar.selectbox("표시 종목 수", [30, 50, 100, "전체"], index=3)
+    filtered = filter_rows(raw_df, index_name, sectors, search)
+    ranked = sort_all_stocks(filtered)
     boxes = st.columns(3)
-    boxes[0].metric("추천 조건 충족", len(ready))
-    boxes[1].metric("평균 종합점수", number_text(ready["Combined Score"].mean()))
-    boxes[2].metric("자료 부족", len(pending))
-    if ready.empty:
-        st.info("해당 조건을 충족한 종목이 없습니다." if base_only else
-                "현재 필터에서 펀더멘털·기술 점수를 모두 갖춘 종목이 없습니다.")
+    scored = ranked["Combined Score"].notna()
+    boxes[0].metric("표시 종목", len(ranked))
+    boxes[1].metric("종합점수 있음", int(scored.sum()))
+    boxes[2].metric("평균 종합점수", number_text(ranked.loc[scored, "Combined Score"].mean()))
+    if ranked.empty:
+        st.info("선택한 조건에 해당하는 종목이 없습니다.")
     else:
-        shown = ready if limit == "전체" else ready.head(int(limit))
+        shown = ranked if limit == "전체" else ranked.head(int(limit))
         st.dataframe(display_table(shown), hide_index=True, width="stretch", height=520)
-        st.caption(f"조건에 맞는 {len(ready)}개 중 {len(shown)}개 표시 · 주가는 원자료 통화 기준")
+        st.caption(f"전체 {len(ranked)}개 중 {len(shown)}개 표시 · 점수가 없는 종목은 목록 아래쪽에 표시")
         row = choose_stock(shown, "recommendation_stock")
         if row is not None:
             show_stock_detail(row)
-    if not pending.empty:
-        with st.expander(f"자료 부족 종목 확인 · {len(pending)}개"):
-            st.caption("필요한 데이터가 채워질 때까지 추천 순위에서 제외합니다.")
-            st.dataframe(display_table(pending, pending=True), hide_index=True, width="stretch")
-            row = choose_stock(pending, "pending_stock")
-            if row is not None:
-                show_stock_detail(row)
     st.caption("점수는 설정한 평가 기준의 충족도이며 미래 수익률이나 상승 확률이 아닙니다.")
     st.sidebar.caption(f"결과 파일: {source_path.name}")
 

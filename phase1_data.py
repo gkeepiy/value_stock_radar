@@ -1,6 +1,7 @@
 import time
 import random
 import typing as t
+import csv
 from datetime import datetime
 from pathlib import Path
 from io import StringIO
@@ -20,6 +21,14 @@ SP500_CSV_URL = (
     "_r/-/data/constituents.csv"
 )
 
+# iShares Russell 2000 ETF (IWM) holdings CSV.
+# IWM tracks the Russell 2000; its holdings provide a practical, refreshed
+# constituent list without relying on a manually maintained ticker list.
+RUSSELL_2000_CSV_URL = (
+    "https://www.ishares.com/us/products/239710/"
+    "ishares-russell-2000-etf/latest-holdings.csv"
+)
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -33,7 +42,8 @@ COOLDOWN_SEC = 60
 
 REVENUE_MAX_YEARS = 4
 
-# 전체 S&P 500
+# None이면 두 지수의 전체 종목을 수집합니다. 숫자를 지정하면 통합 목록을
+# 해당 개수로 제한합니다(테스트용).
 MAX_TICKERS: t.Optional[int] = None
 
 OUTPUT_DIR = Path("data")
@@ -75,7 +85,7 @@ NUMERIC_COLUMNS = [
 
 
 # ============================================================
-# 1) S&P 500 UNIVERSE
+# 1) S&P 500 + RUSSELL 2000 UNIVERSE
 # ============================================================
 
 def normalize_for_yfinance(symbol: str) -> str:
@@ -85,9 +95,10 @@ def normalize_for_yfinance(symbol: str) -> str:
         .strip()
     )
 
-    return symbol.replace(
-        ".",
-        "-",
+    return (
+        symbol
+        .replace(".", "-")
+        .replace(" ", "-")
     )
 
 
@@ -141,6 +152,115 @@ def get_sp500_tickers() -> list[str]:
         ]
 
     return tickers
+
+
+def get_russell2000_tickers() -> list[str]:
+
+    print(
+        "📡 Russell 2000 (IWM 보유종목) 다운로드 중..."
+    )
+
+    response = requests.get(
+        RUSSELL_2000_CSV_URL,
+        headers={
+            "User-Agent": USER_AGENT
+        },
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+    # iShares CSV 앞부분에는 기준일 등 설명 행이 들어갈 수 있으므로
+    # 실제 Ticker 헤더 행부터 읽습니다.
+    lines = response.text.splitlines()
+    header_index = None
+    for index, line in enumerate(lines):
+        try:
+            first_column = next(csv.reader([line]), [""])[0].strip()
+        except (csv.Error, IndexError):
+            continue
+
+        if first_column == "Ticker":
+            header_index = index
+            break
+
+    if header_index is None:
+        raise ValueError(
+            "IWM 데이터에서 Ticker 헤더를 찾을 수 없습니다."
+        )
+
+    df = pd.read_csv(
+        StringIO("\n".join(lines[header_index:]))
+    )
+
+    if "Ticker" not in df.columns:
+        raise ValueError(
+            "IWM 데이터에 Ticker 컬럼이 없습니다."
+        )
+
+    # IWM CSV에는 현금성 자산이나 파생상품도 들어갈 수 있으므로
+    # 개별 주식만 유니버스에 포함합니다.
+    equity_df = df
+    if "Asset Class" in df.columns:
+        equity_df = df[
+            df["Asset Class"]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .eq("equity")
+        ]
+
+    tickers = (
+        equity_df["Ticker"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    tickers = tickers[
+        tickers.ne("")
+        & ~tickers.str.upper().isin(
+            {"USD", "CASH", "-", "N/A", "NAN"}
+        )
+    ]
+    tickers = (
+        tickers.map(normalize_for_yfinance)
+        .drop_duplicates()
+        .tolist()
+    )
+
+    return sorted(tickers)
+
+
+def get_universe_tickers() -> tuple[list[str], dict[str, str]]:
+
+    sp500 = get_sp500_tickers()
+    russell2000 = get_russell2000_tickers()
+
+    index_by_ticker: dict[str, set[str]] = {}
+
+    for ticker in sp500:
+        index_by_ticker.setdefault(ticker, set()).add("S&P 500")
+
+    for ticker in russell2000:
+        index_by_ticker.setdefault(ticker, set()).add("Russell 2000")
+
+    tickers = sorted(index_by_ticker)
+
+    if MAX_TICKERS is not None:
+        tickers = tickers[:MAX_TICKERS]
+
+    index_labels = {
+        ticker: ", ".join(sorted(index_by_ticker[ticker]))
+        for ticker in tickers
+    }
+
+    print(
+        f"✅ S&P 500: {len(sp500)}개 / "
+        f"Russell 2000 (IWM): {len(russell2000)}개 / "
+        f"중복 제거 후: {len(tickers)}개"
+    )
+
+    return tickers, index_labels
 
 
 # ============================================================
@@ -991,12 +1111,7 @@ def main() -> None:
 
     print()
 
-    tickers = get_sp500_tickers()
-
-    print(
-        f"✅ S&P 500 구성종목:"
-        f" {len(tickers)}개"
-    )
+    tickers, index_by_ticker = get_universe_tickers()
 
     print()
 
@@ -1008,6 +1123,13 @@ def main() -> None:
 
     df = collect_all_stocks(
         tickers
+    )
+
+    # 후속 분석에서 지수별로 구분할 수 있도록 종목 출처를 함께 저장합니다.
+    df.insert(
+        1,
+        "Index",
+        df["Ticker"].map(index_by_ticker).fillna("Unknown"),
     )
 
     output_path = save_to_csv(
