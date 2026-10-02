@@ -15,11 +15,11 @@ concurrency:
 
 jobs:
   update-radar:
-
     runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Berlin
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -36,8 +36,7 @@ jobs:
       - name: Choose radar mode
         shell: bash
         run: |
-          DAY=$(date -u +%u)
-
+          DAY=$(date +%u)
           if [ "$DAY" = "1" ]; then
             echo "RADAR_MODE=weekly" >> "$GITHUB_ENV"
           else
@@ -45,22 +44,46 @@ jobs:
           fi
 
       - name: Run radar
-        run: |
-          python run_radar.py
+        run: python run_radar.py
 
       - name: Save updated radar data
+        shell: bash
         run: |
+          set -e
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add data/
-
           if git diff --cached --quiet; then
             echo "No data changes"
-          else
+            exit 0
+          fi
+
+          snapshot=$(mktemp -d)
+          git diff --cached --name-only -z --diff-filter=ACMRT -- data/ > "$snapshot/files"
+          tar --null -T "$snapshot/files" -cf "$snapshot/generated.tar"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+
+            tar -xf "$snapshot/generated.tar"
+            git add --pathspec-from-file="$snapshot/files" --pathspec-file-nul
+
+            if git diff --cached --quiet; then
+              echo "Generated data is already up to date"
+              exit 0
+            fi
+
             git commit -m "Update stock radar data"
 
-            git pull --rebase origin main
+            if git push origin main; then
+              exit 0
+            fi
 
-            git push origin main
-          fi
+            echo "Remote changed; retrying ($attempt/3)"
+          done
+
+          echo "Could not push after 3 attempts"
+          exit 1
